@@ -247,7 +247,7 @@ def telegram_webhook() -> Response:
     # Branch 2: group message (the bot is already a member, someone said
     # something in the chat). Route by group's chat_id.
     if parsed.chat_type in ("group", "supergroup") and parsed.chat_id < 0:
-        _handle_group_message(parsed)
+        _handle_group_message(parsed, update)
         return Response("", status=200)
 
     # Branch 3: DM. The chat_id IS the user's user_id for private chats.
@@ -260,7 +260,7 @@ def telegram_webhook() -> Response:
         # Voice notes, stickers, edited messages we don't care about, etc.
         return Response("", status=200)
 
-    _handle_dm(parsed)
+    _handle_dm(parsed, update)
     return Response("", status=200)
 
 
@@ -319,9 +319,11 @@ def _handle_bot_added_to_group(parsed: TelegramUpdate) -> None:
     )
 
 
-def _handle_group_message(parsed: TelegramUpdate) -> None:
+def _handle_group_message(parsed: TelegramUpdate, raw_update: dict) -> None:
     """A message in a group the bot is a member of. Look up the household
-    by the group's chat_id and forward."""
+    by the group's chat_id and forward the raw Telegram update so the
+    household VM's existing /telegram handler can parse it via
+    Update.de_json."""
     household = db.lookup_household_by_group(engine, parsed.chat_id)
     if household is None:
         log.warning(
@@ -330,19 +332,14 @@ def _handle_group_message(parsed: TelegramUpdate) -> None:
         )
         return
 
-    payload = {
-        "chat_id": parsed.chat_id,           # the group's chat_id
-        "from_user_id": parsed.from_user_id,  # who actually said it
-        "text": parsed.text,
-        "name": parsed.first_name,
-        "from_username": parsed.from_username,
-        "is_group": True,
-    }
+    payload = dict(raw_update)  # forward as-is; VM parses via python-telegram-bot
     if parsed.photo_file_id:
+        # Router pre-downloads images so the VM doesn't have to call getFile
+        # for every photo. VM can opt to use this or fetch on its own.
         img_bytes, img_mime = _download_telegram_photo(parsed.photo_file_id)
         if img_bytes:
-            payload["image_b64"] = base64.b64encode(img_bytes).decode("ascii")
-            payload["image_mime"] = img_mime
+            payload["_router_image_b64"] = base64.b64encode(img_bytes).decode("ascii")
+            payload["_router_image_mime"] = img_mime
     threading.Thread(
         target=_forward_to_household_telegram,
         args=(household["fly_app_name"], payload),
@@ -350,7 +347,7 @@ def _handle_group_message(parsed: TelegramUpdate) -> None:
     ).start()
 
 
-def _handle_dm(parsed: TelegramUpdate) -> None:
+def _handle_dm(parsed: TelegramUpdate, raw_update: dict) -> None:
     """A private-chat message from one human to the bot. Known sender →
     forward to household. Unknown sender → onboarding FSM."""
     chat_id = parsed.chat_id
@@ -358,15 +355,17 @@ def _handle_dm(parsed: TelegramUpdate) -> None:
 
     member = db.lookup_household(engine, sender_id)
     if member:
-        _handle_known_member_dm(parsed, member)
+        _handle_known_member_dm(parsed, member, raw_update)
         return
 
     _handle_unknown_dm(parsed)
 
 
-def _handle_known_member_dm(parsed: TelegramUpdate, member: dict) -> None:
+def _handle_known_member_dm(
+    parsed: TelegramUpdate, member: dict, raw_update: dict,
+) -> None:
     """DM from an active household member. Handle /invite, /feedback,
-    otherwise forward to household VM."""
+    otherwise forward the raw update to the household VM."""
     chat_id = parsed.chat_id
     sender_id = f"tg:{chat_id}"
     text = parsed.text
@@ -407,20 +406,16 @@ def _handle_known_member_dm(parsed: TelegramUpdate, member: dict) -> None:
         notifications.send_text(chat_id, "Got it — passed your message along. 🙏")
         return
 
-    # Forward to household VM
-    payload = {
-        "chat_id": chat_id,
-        "from_user_id": parsed.from_user_id,
-        "text": text,
-        "name": parsed.first_name,
-        "from_username": parsed.from_username,
-        "is_group": False,
-    }
+    # Forward the raw Telegram update so the household VM's /telegram
+    # endpoint can parse it via Update.de_json. The VM was originally
+    # written for direct Telegram webhooks (pre-router) and we preserve
+    # that contract.
+    payload = dict(raw_update)
     if parsed.photo_file_id:
         img_bytes, img_mime = _download_telegram_photo(parsed.photo_file_id)
         if img_bytes:
-            payload["image_b64"] = base64.b64encode(img_bytes).decode("ascii")
-            payload["image_mime"] = img_mime
+            payload["_router_image_b64"] = base64.b64encode(img_bytes).decode("ascii")
+            payload["_router_image_mime"] = img_mime
     threading.Thread(
         target=_forward_to_household_telegram,
         args=(member["fly_app_name"], payload),

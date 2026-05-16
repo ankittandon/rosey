@@ -215,15 +215,25 @@ class TestHandleGroupMessage(unittest.TestCase):
             first_name="Ankit",
             new_chat_members=[],
         )
-        app_module._handle_group_message(parsed)
+        raw_update = {
+            "update_id": 42,
+            "message": {
+                "message_id": 1,
+                "chat": {"id": -100300, "type": "group"},
+                "from": {"id": 100, "first_name": "Ankit", "username": "ankit_t"},
+                "text": "hi rosey",
+            },
+        }
+        app_module._handle_group_message(parsed, raw_update)
         mock_fwd.assert_called_once()
         args, _ = mock_fwd.call_args
         self.assertEqual(args[0], "rosey-h-grp")
+        # Router now forwards the RAW Telegram update so the household VM's
+        # python-telegram-bot Update.de_json can parse it cleanly.
         forwarded_payload = args[1]
-        self.assertEqual(forwarded_payload["chat_id"], -100300)
-        self.assertEqual(forwarded_payload["from_user_id"], 100)
-        self.assertEqual(forwarded_payload["text"], "hi rosey")
-        self.assertTrue(forwarded_payload["is_group"])
+        self.assertEqual(forwarded_payload["update_id"], 42)
+        self.assertEqual(forwarded_payload["message"]["chat"]["id"], -100300)
+        self.assertEqual(forwarded_payload["message"]["text"], "hi rosey")
 
     @patch("router.app.threading.Thread", _SyncThread)
     @patch("router.app._forward_to_household_telegram")
@@ -237,7 +247,7 @@ class TestHandleGroupMessage(unittest.TestCase):
             from_username="",
             new_chat_members=[],
         )
-        app_module._handle_group_message(parsed)
+        app_module._handle_group_message(parsed, {"update_id": 1})
         mock_fwd.assert_not_called()
 
 
@@ -251,6 +261,7 @@ class TestHandleUnknownDM(unittest.TestCase):
             chat_type="private",
             text="",
             start_payload="signup",
+            is_start_command=True,
             from_user_id=200,
             first_name="Ankit",
             new_chat_members=[],
@@ -270,6 +281,7 @@ class TestHandleUnknownDM(unittest.TestCase):
             chat_type="private",
             text="",
             start_payload="",
+            is_start_command=True,
             from_user_id=201,
             first_name="Ankit",
             new_chat_members=[],
