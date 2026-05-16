@@ -1,229 +1,100 @@
-# Rosey
+# rosey (`hosted` branch)
 
-Rosey is a self-hosted household assistant that lives in the chat apps your
-family already uses. Text it a question, a reminder, a shopping-list update,
-or a voice note, and it keeps the shared context in plain markdown files that
-you own.
+This is the **`hosted`** branch of the Rosey repo. It contains the SaaS
+router code for [rosey.house](https://rosey.house) — the QR-code
+onboarding funnel and per-household VM provisioning.
 
-Rosey is built for small households that want practical coordination without
-adding another app: reminders, lists, household facts, web research, and
-weekly summaries from Telegram today, with optional WhatsApp and Alexa entry
-points.
+For the open-source **self-host** product (the agent that runs inside
+each household VM, and that anyone can deploy on their own Fly account
+or laptop), check out the `main` branch.
 
-```text
-You:    we're out of milk
-Rosey:  Added milk to groceries.
+The two branches share zero source files; they live in one repo for
+administrative convenience.
 
-You:    what's the wifi password?
-Rosey:  The guest network password is goldfinch42.
+## Architecture
 
-You:    remind me Friday at 9am to take out the trash
-Rosey:  I'll remind you Friday at 9:00 AM.
+```
+[Phones] ── Telegram ──▶ @RoseyHouseholdBot ──▶ POST /telegram
+                                                    │
+                                                    ▼
+                                           [rosey-router Flask app]
+                                                    │  chat_id known?
+                                          ┌─────────┴─────────┐
+                                        YES                   NO
+                                          │                   │
+                       forward via 6PN to │                   ▼
+                       household VM       │          [onboarding FSM]
+                                          ▼                   │ 6-step dialog
+                              http://rosey-h-XXXX             │ (household name,
+                                .internal:8080                │  members, tz, ...)
+                                                              ▼
+                                                     [provisioning]
+                                                     flyctl: app create,
+                                                     volume, secrets, deploy
+                                                     from rosey-template
+                                                     image (~30s)
 ```
 
-## Features
+The household VM image is built from `main` and published to
+`registry.fly.io/rosey-template:<tag>`. This branch pulls from that
+registry — there's no source-tree dependency between the two branches.
 
-- Chat-first interface through Telegram, plus optional WhatsApp and Alexa handlers.
-- Claude-powered agent loop using Anthropic's local filesystem memory tool.
-- Durable household memory stored as markdown in the resolved memories directory.
-- Reminder scheduler with persistent APScheduler jobs and escalation support.
-- Voice-note transcription through OpenAI Whisper when `OPENAI_API_KEY` is set.
-- Fly.io-ready Docker deployment with a persistent volume for memory and scheduler state.
-- Optional multi-tenant router in `router/` for running Rosey as a hosted service.
+## Quick deploy
 
-## Status
-
-This project is early and intentionally small. Telegram single-household hosting is
-the recommended path. WhatsApp, Alexa, and the SaaS router are present for people
-who want to experiment, but they require more service-specific setup.
-
-## Requirements
-
-- Python 3.11 for local development.
-- An [Anthropic API key](https://platform.claude.com/settings/workspaces/default/keys).
-- A Telegram bot token from [@BotFather](https://t.me/BotFather).
-- A Fly.io account and [`flyctl`](https://fly.io/docs/flyctl/install/) for production hosting.
-- Optional: an OpenAI API key for voice-note transcription.
-
-## Quick Start: Local Telegram Bot
-
-Local mode uses Telegram long polling, so you do not need a public webhook URL.
+See `router/README.md` for full setup. Short version:
 
 ```bash
-git clone https://github.com/aloktiagi/rosey.git
-cd rosey
+git checkout hosted
+cd router
 
-python3.11 -m venv .venv
-.venv/bin/pip install -e '.[telegram]'
-
-cp .env.example .env
-```
-
-Edit `.env`:
-
-```dotenv
-ANTHROPIC_API_KEY=sk-ant-...
-TELEGRAM_BOT_TOKEN=1234567890:AAEh...
-MEMORY_ROOT=./memories
-SCHEDULER_TZ=America/Los_Angeles
-```
-
-Start the bot:
-
-```bash
-.venv/bin/python -m telegram_bot
-```
-
-Message your bot in Telegram. Send `/start` first to get your Telegram chat ID,
-then add allowed household members to `memories/household.md`:
-
-```markdown
-# Household
-
-Members:
-- Alex (tg:12345678)
-- Sam (tg:87654321)
-```
-
-If `household.md` is missing or has no members, Rosey accepts messages from
-anyone who can reach the bot. That is useful for first setup, but not recommended
-for a real deployment.
-
-## Deploy on Fly.io
-
-The production container runs a Quart server with routes for Telegram,
-WhatsApp, Alexa, and health checks. Telegram webhook mode is enabled when
-`TELEGRAM_WEBHOOK_URL` is set.
-
-```bash
-fly launch --no-deploy --copy-config --name <your-app-name>
-fly volumes create memory_data --size 1 --region <your-region> -a <your-app-name>
-
-python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
-```
-
-Use the generated token as `TELEGRAM_WEBHOOK_SECRET`:
-
-```bash
 fly secrets set \
   ANTHROPIC_API_KEY=sk-ant-... \
-  TELEGRAM_BOT_TOKEN=1234567890:AAEh... \
-  TELEGRAM_WEBHOOK_URL=https://<your-app-name>.fly.dev \
-  TELEGRAM_WEBHOOK_SECRET=<generated-secret> \
-  -a <your-app-name>
+  TELEGRAM_BOT_TOKEN=... \
+  TELEGRAM_BOT_USERNAME=RoseyHouseholdBot \
+  TELEGRAM_WEBHOOK_SECRET=$(python -c 'import secrets; print(secrets.token_urlsafe(32))') \
+  ROSEY_INTERNAL_TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(32))') \
+  ROSEY_OPERATOR_TELEGRAM_ID=<your chat id> \
+  FLY_API_TOKEN=<org token> \
+  OPENAI_API_KEY=... \
+  ROUTER_DRY_RUN=0 \
+  --stage -a rosey-router
 
-fly deploy -a <your-app-name>
+fly deploy --remote-only -a rosey-router
+
+curl -sS -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
+  -d url=https://rosey-router.fly.dev/telegram \
+  -d secret_token=$TELEGRAM_WEBHOOK_SECRET
 ```
 
-Optional voice transcription:
+Disable bot privacy mode in BotFather (`/setprivacy` → Disable).
+
+## Tests
 
 ```bash
-fly secrets set OPENAI_API_KEY=sk-... -a <your-app-name>
+cd router && python -m unittest discover -s tests
 ```
 
-The included `fly.toml` mounts `/data`, sets `MEMORY_ROOT=/data/memories`, and
-keeps at least one machine running so reminders can fire on time.
+## Contract with `main`
 
-## Configuration
+The router serializes a `HOUSEHOLD_TOML` Fly secret that the household
+VM (built from `main`) reads at startup:
 
-| Variable | Required | Purpose |
-|---|---:|---|
-| `ANTHROPIC_API_KEY` | Yes | Claude API key for the agent. |
-| `TELEGRAM_BOT_TOKEN` | Yes | Telegram bot token from BotFather. |
-| `MEMORY_ROOT` | Yes | Directory where Rosey stores markdown memory files. |
-| `SCHEDULER_TZ` | Recommended | Timezone for reminders and summaries. |
-| `TELEGRAM_WEBHOOK_URL` | Production | Base HTTPS URL for webhook mode. |
-| `TELEGRAM_WEBHOOK_SECRET` | Production | Secret token checked on Telegram webhook requests. |
-| `OPENAI_API_KEY` | Optional | Enables voice-note transcription. |
-| `BAILEYS_MODE` | Optional | Set to `on` to run the WhatsApp Baileys sidecar. |
-| `BAILEYS_BRIDGE_SECRET` | Optional | Shared secret between the Baileys sidecar and Python server. |
+```toml
+household_name = "The Tandons"
+shopping_cadence = "weekly"
+upfront_context = "we have a dog and 2 kids in school"
 
-See `.env.example` for a starter local environment file.
+[[members]]
+name = "Ankit"
+telegram_id = "100"            # for known members
+notes = ""
 
-## How It Works
-
-```text
-Telegram / WhatsApp / Alexa
-          |
-          v
-    server.py / telegram_bot.py
-          |
-          v
-       agent.py
-          |
-          +--> memory_tool.py  ->  memories/*.md
-          +--> tools.py        ->  web_search and web_fetch
-          +--> scheduler.py    ->  persistent reminder jobs
-          |
-          v
-   reply through channels.py
+[[members]]
+name = "Sarah"
+telegram_username = "sarah_t"  # for v2 pre-rostered placeholders
+notes = ""
 ```
 
-The default deployment is single-tenant: one bot, one household, one memory
-directory. `MEMORY_ROOT` can point directly at `memories/` or at its parent
-directory; `paths.py` normalizes both forms. The router service in `router/`
-is a separate app for provisioning many isolated household VMs.
-
-## Repository Layout
-
-| Path | Purpose |
-|---|---|
-| `agent.py` | Claude tool loop, system prompt, and message handling. |
-| `server.py` | Production Quart app for webhooks and health checks. |
-| `telegram_bot.py` | Local polling mode and Telegram handler functions. |
-| `scheduler.py` | Persistent reminder scheduling and acknowledgement tracking. |
-| `channels.py` | Outbound dispatch to Telegram, WhatsApp, and Baileys. |
-| `memory_tool.py` | File-backed memory tool with path and size guards. |
-| `roster.py` | Parses `household.md` members and identifiers. |
-| `reminder_format.py` | Shared parser for reminder markdown lines. |
-| `baileys/` | Optional WhatsApp MultiDevice sidecar. |
-| `router/` | Optional multi-tenant router service. |
-| `website/` | Static marketing site. |
-| `scripts/` | Deployment and smoke-test helpers. |
-
-## Development
-
-Run the focused test scripts directly:
-
-```bash
-.venv/bin/python test_gate_unified.py
-.venv/bin/python test_reminder_fixes.py
-.venv/bin/python test_recurring_reminders.py
-.venv/bin/python scripts/test_escalation_ladder.py
-```
-
-Check syntax:
-
-```bash
-.venv/bin/python -m compileall -q .
-```
-
-There is no complete offline test for `agent.py` because the real agent path
-makes live API calls. For agent changes, run locally with a test Telegram bot
-and watch the logs.
-
-## Privacy Notes
-
-Rosey stores household state in files you control. Keep `memories/`, `.env`,
-local database files, and deployment secrets out of git. The repository ignores
-those paths by default.
-
-The code follows a metadata-only logging convention: log sender identifiers and
-message lengths, not message bodies. Please preserve that convention in new
-channels or tools.
-
-## Costs
-
-A small always-on Fly.io machine with a 1 GB volume is usually around $5/month.
-Anthropic API usage varies by household; a modest family deployment is commonly
-in the low tens of dollars per month. Check current model pricing before relying
-on any estimate.
-
-## Contributing
-
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for extension points and project
-conventions.
-
-## License
-
-[MIT](./LICENSE)
+`main`'s `household.py` accepts `telegram_id`, `telegram_username`, and
+a legacy `phone` field. If you add or rename a field here, update
+`household.py` on `main` too.
