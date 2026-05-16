@@ -125,6 +125,7 @@ class TelegramUpdate:
     chat_type: str = ""              # "private", "group", "supergroup", "channel"
     text: str = ""
     start_payload: str = ""           # parsed from "/start <payload>"
+    is_start_command: bool = False    # True if original text was "/start" or "/start ..."
     from_user_id: Optional[int] = None
     from_username: str = ""           # lowercased, no "@"
     first_name: str = ""
@@ -150,6 +151,7 @@ def _telegram_extract(update: dict) -> TelegramUpdate:
     out.first_name = sender.get("first_name") or ""
 
     text = (msg.get("text") or msg.get("caption") or "").strip()
+    out.is_start_command = text.lower().startswith("/start")
     out.text, out.start_payload = _parse_start_payload(text)
 
     # Photo: forward the largest variant to the household VM
@@ -249,7 +251,12 @@ def telegram_webhook() -> Response:
         return Response("", status=200)
 
     # Branch 3: DM. The chat_id IS the user's user_id for private chats.
-    if not parsed.text and not parsed.photo_file_id and not parsed.start_payload:
+    if (
+        not parsed.text
+        and not parsed.photo_file_id
+        and not parsed.start_payload
+        and not parsed.is_start_command
+    ):
         # Voice notes, stickers, edited messages we don't care about, etc.
         return Response("", status=200)
 
