@@ -38,6 +38,7 @@ except ImportError:  # pragma: no cover
 
 from mcp.server.fastmcp import FastMCP
 
+import feed_format
 from paths import memories_dir
 from reminder_format import (
     ACKED_RE,
@@ -74,6 +75,12 @@ def _append(rel: str, line: str) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("a", encoding="utf-8") as f:
         f.write(line.rstrip("\n") + "\n")
+
+
+def _write(rel: str, content: str) -> None:
+    p = _safe(rel)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
 
 
 # --- discovery tools (robust to whatever the real memory layout is) ----------
@@ -246,9 +253,13 @@ def _parse_clock(s: str) -> tuple[int, int] | None:
     return None
 
 
-def _parse_when(when: str, now: datetime) -> datetime | None:
+def _parse_when(when: str, now: datetime, prefer_past: bool = False) -> datetime | None:
     """Best-effort parse of a `when` expression into a concrete datetime.
-    Returns None when no time can be determined (caller should ask the user)."""
+    Returns None when no time can be determined (caller should ask the user).
+
+    `prefer_past` flips the bare-clock heuristic: reminders assume a bare time
+    is the NEXT occurrence (future), but logged events (feeds) assume the most
+    recent PAST one — so "11:04 pm" at 11:04 pm logs today, not tomorrow."""
     s = (when or "").strip().lower()
     if not s:
         return None
@@ -318,10 +329,16 @@ def _parse_when(when: str, now: datetime) -> datetime | None:
         return datetime(base_date.year, base_date.month, base_date.day, hour, minute)
 
     if clock is not None:
-        # Bare time → today if still ahead, otherwise tomorrow.
         cand = now.replace(hour=clock[0], minute=clock[1], second=0, microsecond=0)
-        if cand <= now:
-            cand += timedelta(days=1)
+        if prefer_past:
+            # Most recent past occurrence; small grace so a just-now time that
+            # reads a minute ahead (clock skew / rounding) still counts as today.
+            if cand > now + timedelta(minutes=2):
+                cand -= timedelta(days=1)
+        else:
+            # Next occurrence (default, for reminders).
+            if cand <= now:
+                cand += timedelta(days=1)
         return cand
 
     return None
@@ -455,41 +472,147 @@ def remember(note: str) -> str:
     return "Saved to household memory."
 
 
+_FEED_LOG = "knowledge/baby_feed_log.md"
+
+
+def _normalize_feed_type(kind: str) -> str:
+    """Map a spoken feed type to the log's canonical Type value."""
+    k = (kind or "").strip().lower().replace(" ", "")
+    if not k:
+        return ""
+    if "bottle" in k or "formula" in k:
+        return "Bottle"
+    if k in ("bf-l+r", "bflr", "both", "bothbreasts") or ("left" in k and "right" in k):
+        return "BF-L+R"
+    if "left" in k or k in ("bf-l", "bfl"):
+        return "BF-L"
+    if "right" in k or k in ("bf-r", "bfr"):
+        return "BF-R"
+    if "breast" in k or k.startswith("bf") or k == "nursing":
+        return "BF"
+    return kind.strip()
+
+
+def _feed_summary(row: dict) -> str:
+    """Short spoken-friendly description of a feed row."""
+    parts = [row.get(c, "") for c in ("Type", "Amount", "Duration")]
+    body = ", ".join(p for p in parts if p and p != "—") or "diaper"
+    extras = []
+    if row.get("Pee"):
+        extras.append("pee")
+    if row.get("Poop"):
+        extras.append("poop")
+    if extras:
+        body += " (" + " + ".join(extras) + ")"
+    return body
+
+
 @mcp.tool()
 def log_feed(
     amount: str = "",
     kind: str = "",
     duration: str = "",
     when: str = "",
+    pee: str = "",
+    poop: str = "",
     notes: str = "",
 ) -> str:
     """Record a baby feeding in the household's shared FEED LOG
-    (knowledge/baby_feed_log.md) — the same file the chat assistant reads when
-    asked "when was the last feed?". Use this (not `remember`) for any feeding,
-    so it shows up across every channel.
+    (knowledge/baby_feed_log.md) — the SAME Markdown table the chat assistant
+    reads when asked "when was the last feed?". Use this (not `remember`) for any
+    feeding so it shows up across every channel.
 
-    Fields are all optional; include what you know:
-      amount   — how much, e.g. "1.5 oz", "30 ml"
-      kind     — type, e.g. "bottle", "breastfeed left"/"BF-L", "formula", "solids"
-      duration — how long, e.g. "25 mins"
-      when     — when it happened; DEFAULTS TO NOW. Accepts "now", "1:30pm",
-                 "today 2pm", "20 minutes ago", "YYYY-MM-DD HH:MM".
+    Required to record a feed: the type, and a measure (oz for a bottle, minutes
+    for a breastfeed). If something required is missing, this returns a question
+    to ask the user — do that and call again; don't log a half-empty entry.
+
+      kind     — "bottle", "breastfeed left"/"BF-L", "breastfeed right"/"BF-R",
+                 "BF" (unspecified breast), "BF-L+R" (both)
+      amount   — how much, e.g. "1.5 oz", "15 mL", "~1 oz"
+      duration — how long for a breastfeed, e.g. "20 mins"
+      when     — DEFAULTS TO NOW. Accepts "now", "1:30pm", "today 2pm",
+                 "20 minutes ago", "YYYY-MM-DD HH:MM". Never logs in the future.
+      pee/poop — "yes" if there was one (or a volume like "✓ ~2 oz")
       notes    — anything else worth recording.
     """
+    type_norm = _normalize_feed_type(kind)
+    is_bottle = type_norm == "Bottle"
+    is_bf = type_norm.startswith("BF")
+    has_feed = bool(type_norm) or bool(amount.strip()) or bool(duration.strip())
+    has_diaper = bool(feed_format.diaper_cell(pee)) or bool(feed_format.diaper_cell(poop))
+
+    # Clarify required info instead of writing an incomplete entry.
+    if not has_feed and not has_diaper:
+        return ("I can log that — is it a feed or a diaper change? For a feed, "
+                "tell me breast or bottle, and how much (oz) or how long (mins).")
+    if has_feed:
+        if not type_norm:
+            return "Was that a breastfeed or a bottle?"
+        if is_bottle and not amount.strip():
+            return "How much was the bottle — how many ounces (or mL)?"
+        if is_bf and not duration.strip() and not amount.strip():
+            return "How long was the feed — about how many minutes?"
+
     now = _local_now()
-    dt = _parse_when(when, now) if when.strip() else now
+    dt = _parse_when(when, now, prefer_past=True) if when.strip() else now
     if dt is None:
         dt = now
-    ts = dt.strftime("%Y-%m-%d %H:%M")
 
-    detail = ", ".join(p.strip() for p in (kind, amount, duration) if p and p.strip())
-    detail = detail or "feed"
-    line = f"- [{ts}] {detail}"
+    amt = amount.strip()
+    if is_bf and not amt:
+        amt = "~1 oz"  # log convention: BF sessions assumed ~1 oz unless noted
+
+    diaper_only = has_diaper and not has_feed
+    fields = {
+        "Date": dt.strftime("%Y-%m-%d"),
+        "Time": feed_format.fmt_time(dt),
+        "Type": type_norm or ("—" if diaper_only else ""),
+        "Amount": amt or ("—" if diaper_only else ""),
+        "Duration": duration.strip() or ("—" if diaper_only else ""),
+        "Pee": feed_format.diaper_cell(pee),
+        "Poop": feed_format.diaper_cell(poop),
+        "Notes": notes.strip(),
+    }
+    _write(_FEED_LOG, feed_format.append_feed(_read(_FEED_LOG), fields))
+    return f"Logged: {_feed_summary(fields)} at {fields['Time']} on {fields['Date']}."
+
+
+@mcp.tool()
+def amend_last_feed(
+    amount: str = "",
+    kind: str = "",
+    duration: str = "",
+    pee: str = "",
+    poop: str = "",
+    notes: str = "",
+) -> str:
+    """Correct or add detail to the MOST RECENT feed entry, in place — instead of
+    logging a duplicate. Use this when the user fixes the feed they just logged,
+    e.g. "actually there was poop too" or "it was 2 oz, not 1". Only the fields
+    you pass change."""
+    updates: dict = {}
+    t = _normalize_feed_type(kind)
+    if t:
+        updates["Type"] = t
+    if amount.strip():
+        updates["Amount"] = amount.strip()
+    if duration.strip():
+        updates["Duration"] = duration.strip()
+    if feed_format.diaper_cell(pee):
+        updates["Pee"] = feed_format.diaper_cell(pee)
+    if feed_format.diaper_cell(poop):
+        updates["Poop"] = feed_format.diaper_cell(poop)
     if notes.strip():
-        line += f" — {notes.strip()}"
-    _append("knowledge/baby_feed_log.md", line)
+        updates["Notes"] = notes.strip()
+    if not updates:
+        return "What should I change about the last feed?"
 
-    return f"Logged feed: {detail} at {_fmt_time(dt)} ({_date_label(dt.date(), now.date())})."
+    result = feed_format.amend_last_feed(_read(_FEED_LOG), updates)
+    if result is None:
+        return "There's no feed entry yet to amend."
+    new_content, row = result
+    _write(_FEED_LOG, new_content)
+    return f"Updated the last feed ({row.get('Date','')} {row.get('Time','')}): {_feed_summary(row)}."
 
 
 if __name__ == "__main__":

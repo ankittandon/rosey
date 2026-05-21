@@ -35,7 +35,7 @@ MCP_ALLOWED_TOOLS = [
     "get_household", "remember",
     "list_grocery_items", "add_grocery_item",
     "list_reminders", "add_reminder",
-    "log_feed",
+    "log_feed", "amend_last_feed",
 ]
 MCP_AUTO_RUN_TOOLS = MCP_ALLOWED_TOOLS
 
@@ -44,8 +44,12 @@ SYSTEM_PROMPT = (
     "For tool-backed questions, call the needed tool silently before speaking. "
     "Do not say 'let me check', 'one moment', or similar filler as a standalone reply. "
     "Fetch or change the thing, then answer in the same turn. "
-    "To record a baby feeding, call log_feed (NOT remember) so it lands in the shared "
-    "feed log; default the time to now unless the user gives one. "
+    "To record a baby feeding, call log_feed (NOT remember): give the type (breast "
+    "left/right or bottle) and a measure — ounces for a bottle, minutes for a "
+    "breastfeed. If the type or the amount/duration is missing, ASK the user a brief "
+    "question to confirm BEFORE logging; never log a half-empty feed. The time defaults "
+    "to now. To fix or add detail to the feed you just logged (e.g. 'there was poop "
+    "too', 'it was 2 oz not 1'), call amend_last_feed instead of logging again. "
     "Memory files can be long logs with timestamps and status notes. Do NOT read them "
     "verbatim. Extract only what was asked: if asked for tomorrow's reminders, read just "
     "tomorrow's, as a short spoken list of the task text, skipping ids, timestamps, "

@@ -36,9 +36,11 @@ os.environ.setdefault("SCHEDULER_TZ", "UTC")
 sys.path.insert(0, str(Path(__file__).parent))
 
 import mcp_server  # noqa: E402
+import feed_format as ff  # noqa: E402
 
 MEM = mcp_server.ROOT  # <_TMP>/memories
 REMINDERS = MEM / "reminders.md"
+FEED = MEM / "knowledge" / "baby_feed_log.md"
 
 PASS = "\033[32m✓\033[0m"
 FAIL = "\033[31m✗\033[0m"
@@ -223,38 +225,6 @@ def test_add_reminder_roundtrip() -> None:
           "urg:" not in back, detail=back)
 
 
-def test_log_feed() -> None:
-    from reminder_format import LINE_RE
-    feed = MEM / "knowledge" / "baby_feed_log.md"
-    feed.parent.mkdir(parents=True, exist_ok=True)
-    feed.write_text("", encoding="utf-8")
-    notes = MEM / "notes.md"
-    notes.write_text("", encoding="utf-8")
-
-    now = mcp_server._local_now()
-
-    # No time given → defaults to now, lands in the FEED log (not notes.md).
-    msg = mcp_server.log_feed(amount="1.5 oz", kind="bottle")
-    content = feed.read_text(encoding="utf-8")
-    check("log_feed: wrote to knowledge/baby_feed_log.md",
-          "bottle, 1.5 oz" in content, detail=content)
-    written = next((l for l in content.splitlines() if l.startswith("- [")), "")
-    check("log_feed: entry is a dated, parseable line",
-          bool(LINE_RE.match(written)), detail=repr(written))
-    check("log_feed: did NOT land in notes.md",
-          "1.5 oz" not in notes.read_text(encoding="utf-8"), detail=notes.read_text())
-    check("log_feed: confirmation names what was logged",
-          "bottle, 1.5 oz" in msg, detail=msg)
-
-    # Explicit fields + time.
-    feed.write_text("", encoding="utf-8")
-    mcp_server.log_feed(amount="1 oz", kind="BF-L", duration="25 mins", when="today 1:30pm")
-    line = feed.read_text(encoding="utf-8").strip()
-    expected = f"- [{now.date()} 13:30] BF-L, 1 oz, 25 mins"
-    check("log_feed: composes kind/amount/duration with the given time",
-          line == expected, detail=repr(line))
-
-
 def test_add_reminder_no_time() -> None:
     REMINDERS.write_text("# Reminders\n\n", encoding="utf-8")
     before = REMINDERS.read_text(encoding="utf-8")
@@ -264,6 +234,104 @@ def test_add_reminder_no_time() -> None:
           "couldn't work out a time" in msg, detail=msg)
     check("add (no time): writes nothing (no ghost/malformed entry)",
           before == after, detail=repr(after))
+
+
+def _seed_feed_log() -> None:
+    FEED.parent.mkdir(parents=True, exist_ok=True)
+    FEED.write_text(
+        "# Siya Feed Log\n\n## Individual Feeds\n"
+        "| Date       | Time     | Type      | Amount   | Duration  | Pee          | Poop | Notes |\n"
+        "|------------|----------|-----------|----------|-----------|--------------|------|-------|\n"
+        "| 2026-05-20 | 5:20 pm  | BF-R      | ~1 oz    | 20 mins   | ✓            |      |       |\n",
+        encoding="utf-8",
+    )
+
+
+def test_feed_format_module() -> None:
+    row = {"Date": "2026-05-20", "Time": "5:20 pm", "Type": "BF-R", "Amount": "~1 oz",
+           "Duration": "20 mins", "Pee": "✓", "Poop": "", "Notes": ""}
+    parsed = ff.parse_row(ff.render_row(row))
+    check("feed_format: render/parse round-trip",
+          parsed["Type"] == "BF-R" and parsed["Amount"] == "~1 oz" and parsed["Pee"] == "✓",
+          detail=repr(parsed))
+
+    _seed_feed_log()
+    new = ff.append_feed(FEED.read_text(), {
+        "Date": "2026-05-20", "Time": "6:00 pm", "Type": "Bottle", "Amount": "2 oz",
+        "Duration": "", "Pee": "", "Poop": "", "Notes": ""})
+    _, last = ff.last_feed(new)
+    check("feed_format: append adds a new last row",
+          last["Type"] == "Bottle" and last["Amount"] == "2 oz", detail=new)
+    check("feed_format: stays a table (no stray '- [' lines)", "- [" not in new, detail=new)
+
+    res = ff.amend_last_feed(new, {"Poop": "✓"})
+    check("feed_format: amend merges into last row",
+          res is not None and res[1]["Poop"] == "✓" and res[1]["Type"] == "Bottle",
+          detail=str(res))
+
+
+def test_parse_when_past() -> None:
+    now = datetime(2026, 5, 20, 22, 0)  # 10:00 pm
+    f = lambda w: mcp_server._parse_when(w, now, prefer_past=True)
+    cases = [
+        ("9:00 pm",     datetime(2026, 5, 20, 21, 0)),   # earlier today
+        ("11:00 pm",    datetime(2026, 5, 19, 23, 0)),   # future tonight → yesterday
+        ("10:01 pm",    datetime(2026, 5, 20, 22, 1)),   # within grace → today
+        ("8 hours ago", datetime(2026, 5, 20, 14, 0)),
+    ]
+    for raw, exp in cases:
+        got = f(raw)
+        ok = got is not None and got.replace(tzinfo=None) == exp
+        check(f"parse_when(past): {raw!r} → {exp}", ok, detail=f"got {got!r}")
+
+
+def test_log_feed_table() -> None:
+    today = str(mcp_server._local_now().date())
+
+    _seed_feed_log()
+    before = FEED.read_text()
+    msg = mcp_server.log_feed(kind="bottle")  # no amount → clarify
+    check("log_feed: bottle w/o amount asks for ounces", "ounce" in msg.lower(), detail=msg)
+    check("log_feed: clarify writes nothing", FEED.read_text() == before, detail="file changed")
+
+    check("log_feed: empty asks what to log",
+          "feed or a diaper" in mcp_server.log_feed().lower(), detail="")
+
+    mcp_server.log_feed(kind="bottle", amount="3 oz")
+    _, last = ff.last_feed(FEED.read_text())
+    check("log_feed: bottle row written as a table row",
+          last["Type"] == "Bottle" and last["Amount"] == "3 oz" and last["Date"] == today,
+          detail=str(last))
+    check("log_feed: no malformed bracket lines", "- [" not in FEED.read_text(),
+          detail=FEED.read_text())
+
+    _seed_feed_log()
+    cl = mcp_server.log_feed(kind="BF-L")  # no duration → clarify
+    check("log_feed: BF w/o duration asks minutes", "minute" in cl.lower(), detail=cl)
+    mcp_server.log_feed(kind="BF-L", duration="20 mins")
+    _, last = ff.last_feed(FEED.read_text())
+    check("log_feed: BF row defaults amount to ~1 oz",
+          last["Type"] == "BF-L" and last["Duration"] == "20 mins" and last["Amount"] == "~1 oz",
+          detail=str(last))
+
+    _seed_feed_log()
+    mcp_server.log_feed(pee="yes", poop="yes")  # diaper-only
+    _, last = ff.last_feed(FEED.read_text())
+    check("log_feed: diaper-only row uses — for feed columns",
+          last["Type"] == "—" and last["Pee"] == "✓" and last["Poop"] == "✓", detail=str(last))
+
+
+def test_amend_last_feed_tool() -> None:
+    _seed_feed_log()
+    mcp_server.log_feed(kind="bottle", amount="3 oz")
+    msg = mcp_server.amend_last_feed(pee="yes", poop="yes")
+    _, last = ff.last_feed(FEED.read_text())
+    check("amend_last_feed: edits last row in place",
+          last["Poop"] == "✓" and last["Pee"] == "✓" and last["Type"] == "Bottle",
+          detail=str(last))
+    check("amend_last_feed: no duplicate row added",
+          FEED.read_text().count("Bottle") == 1, detail=FEED.read_text())
+    check("amend_last_feed: confirmation says updated", "updated" in msg.lower(), detail=msg)
 
 
 if __name__ == "__main__":
@@ -277,7 +345,10 @@ if __name__ == "__main__":
     test_empty_day()
     test_empty_file()
     test_parse_when()
-    test_log_feed()
+    test_parse_when_past()
+    test_feed_format_module()
+    test_log_feed_table()
+    test_amend_last_feed_tool()
     test_add_reminder_roundtrip()
     test_add_reminder_no_time()
 

@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover
 
 from anthropic import Anthropic
 
+import feed_format
 from memory_tool import FileMemoryTool, RedactingMemoryTool
 from redact import Redactor, enabled as redaction_enabled
 from reminder_format import FORMAT_DOC as REMINDER_FORMAT
@@ -127,6 +128,8 @@ str_replace the existing one. Format per entry:
 Do not update the INDEX for incremental edits within an existing topic
 (e.g. logging another feed in baby_feed_log.md doesn't change what the
 file is about). The INDEX captures topics, not contents.
+
+Baby feed logging — {feed_format_doc}
 
 Tools available to you:
 - memory: read and write the /memories directory.
@@ -810,6 +813,7 @@ def handle_message(
             now_local=now_local,
             tz_name=tz_name,
             reminder_format=REMINDER_FORMAT,
+            feed_format_doc=feed_format.FORMAT_DOC,
             memory_index=memory_index,
             knowledge_index=knowledge_index,
             recent_fires_block=recent_fires_block,

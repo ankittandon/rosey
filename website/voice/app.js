@@ -59,7 +59,7 @@ const CONFIG = {
     "get_household", "remember",
     "list_grocery_items", "add_grocery_item",
     "list_reminders", "add_reminder",
-    "log_feed",
+    "log_feed", "amend_last_feed",
   ],
   // All of these are low-risk household actions, so auto-run them (no approval
   // prompt) for a smooth hands-free experience. When you add genuinely sensitive
@@ -68,7 +68,7 @@ const CONFIG = {
     "get_household", "remember",
     "list_grocery_items", "add_grocery_item",
     "list_reminders", "add_reminder",
-    "log_feed",
+    "log_feed", "amend_last_feed",
   ],
 
   // Lifecycle timings
@@ -84,8 +84,11 @@ const CONFIG = {
     "For tool-backed questions, call the needed tool silently before speaking. " +
     "Do not say 'let me check', 'one moment', or similar filler as a standalone reply. " +
     "Fetch or change the thing, then answer in the same turn. " +
-    "To record a baby feeding, call log_feed (NOT remember) so it lands in the shared " +
-    "feed log; default the time to now unless the user gives one. " +
+    "To record a baby feeding, call log_feed (NOT remember): give the type (breast " +
+    "left/right or bottle) and a measure — ounces for a bottle, minutes for a breastfeed. " +
+    "If the type or amount/duration is missing, ASK a brief question to confirm before " +
+    "logging; never log a half-empty feed. The time defaults to now. To fix the feed you " +
+    "just logged (e.g. 'there was poop too'), call amend_last_feed, don't log again. " +
     "Memory files can be long logs with timestamps and status notes. Do NOT read them " +
     "verbatim. Extract only what was asked: if asked for tomorrow's reminders, read just " +
     "tomorrow's, as a short spoken list of the task text (skip ids, timestamps, ack/escalation " +
