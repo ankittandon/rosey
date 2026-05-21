@@ -168,8 +168,13 @@ async function openSession() {
       body: JSON.stringify({ model: CONFIG.REALTIME_MODEL }),
     });
     if (!secretResp.ok) throw new Error("session endpoint failed: " + secretResp.status);
-    const { client_secret } = await secretResp.json();
-    const ephemeralKey = client_secret?.value || client_secret;
+    // The client-secrets endpoint returns the ephemeral key at top-level `value`
+    // (current shape: { value, expires_at, session }), but older shapes nested
+    // it under client_secret. Handle both so we don't pass an undefined token.
+    const secret = await secretResp.json();
+    const ephemeralKey =
+      secret.value || secret.client_secret?.value || secret.client_secret;
+    if (!ephemeralKey) throw new Error("no ephemeral key in /session response");
 
     // 2) Capture mic and set up the peer connection.
     const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
