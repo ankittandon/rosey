@@ -14,6 +14,7 @@ cleanup() {
   # Be polite first, kill -9 if needed
   [[ -n "${BAILEYS_PID:-}" ]] && kill -TERM "$BAILEYS_PID" 2>/dev/null || true
   [[ -n "${HYPERCORN_PID:-}" ]] && kill -TERM "$HYPERCORN_PID" 2>/dev/null || true
+  [[ -n "${MCP_PID:-}" ]] && kill -TERM "$MCP_PID" 2>/dev/null || true
   wait
   exit 0
 }
@@ -29,6 +30,21 @@ if [[ "${BAILEYS_MODE:-off}" == "on" ]]; then
 else
   echo "[start] BAILEYS_MODE=off — skipping baileys sidecar (Cloud API only)"
 fi
+
+# Co-located MCP server (port 8089) — exposes /data/memories as MCP tools so
+# the voice PWA and other MCP clients share the household's memory. Supervised
+# in a restart loop so an MCP crash NEVER takes down the bot (the loop keeps
+# it out of the `wait -n` that crashes the container on a critical-child exit).
+echo "[start] launching mcp server (supervised, :8089)"
+(
+  while true; do
+    python /app/mcp_server.py
+    echo "[start] mcp server exited, restarting in 2s"
+    sleep 2
+  done
+) &
+MCP_PID=$!
+echo "[start] mcp supervisor pid=$MCP_PID"
 
 echo "[start] launching hypercorn"
 hypercorn server:asgi_app \

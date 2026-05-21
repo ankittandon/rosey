@@ -48,7 +48,32 @@ primary_region = 'sjc'
     timeout = '5s'
     grace_period = '20s'
 
+# MCP endpoint (shared household memory) — the co-located mcp_server.py on
+# internal :8089, exposed externally on :8443. The voice PWA and other MCP
+# clients connect here; because it's the SAME container/volume as the engine,
+# all channels share one memory. External 8443 → TLS-terminated → :8089.
+#
+# SECURITY: this serves real household memory and is currently unauthenticated
+# (see mcp_server.py). Demo posture only until per-session auth is added.
+[[services]]
+  protocol = 'tcp'
+  internal_port = 8089
+  auto_stop_machines = 'off'
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 8443
+    handlers = ['tls', 'http']
+
+  [[services.tcp_checks]]
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '20s'
+
 [[vm]]
   cpu_kind = 'shared'
   cpus = 1
-  memory_mb = 512
+  # Bumped 512 -> 1024 for headroom: bot + (optional) baileys + the MCP server
+  # now share one machine. Lower it back if you confirm RAM use stays well under.
+  memory_mb = 1024

@@ -21,6 +21,10 @@ dependencies = [
     # multiple channels under one HTTP surface.
     "quart>=0.20",
     "hypercorn>=0.16",
+    # Co-located MCP server (mcp_server.py) exposes /data/memories as MCP tools
+    # so every channel shares one household memory. Pulls in starlette/uvicorn.
+    # If this conflicts with other deps at build time, pin versions.
+    "mcp>=1.9",
 ]
 
 [project.optional-dependencies]
@@ -38,4 +42,4 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["memory_tool", "agent", "alexa_handler", "cli", "app", "summary", "household", "reminders", "telegram_bot", "transcribe", "channels", "paths", "redact", "reminder_format", "roster", "tools", "scheduler", "gate", "server", "whatsapp_handler"]
+py-modules = ["memory_tool", "agent", "alexa_handler", "cli", "app", "summary", "household", "reminders", "telegram_bot", "transcribe", "channels", "paths", "redact", "reminder_format", "roster", "tools", "scheduler", "gate", "server", "whatsapp_handler", "mcp_server"]

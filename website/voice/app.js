@@ -49,7 +49,10 @@ const CONFIG = {
   // Rosey's tools, exposed as a remote MCP server (rosey-mcp/). Tool names
   // must match server.py. Keep the surface narrow.
   MCP_SERVER_LABEL: "rosey",
-  MCP_SERVER_URL: "https://rosey-mcp.fly.dev/mcp",
+  // Co-located MCP endpoint on the rosey engine app (shared household memory:
+  // same /data/memories the WhatsApp/Telegram bot uses). External :8443 -> :8089.
+  // (The standalone rosey-mcp.fly.dev/mcp is the isolated-memory variant.)
+  MCP_SERVER_URL: "https://rosey.fly.dev:8443/mcp",
   MCP_ALLOWED_TOOLS: [
     "get_household", "remember",
     "list_grocery_items", "add_grocery_item",
