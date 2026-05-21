@@ -1,0 +1,25 @@
+# Fly config for the Rosey voice token server.
+# Deploy:
+#   fly apps create rosey-voice-token        # once
+#   fly secrets set OPENAI_API_KEY=sk-...      -a rosey-voice-token
+#   fly secrets set ROSEY_PWA_ORIGIN=https://rosey.family  -a rosey-voice-token
+#   fly deploy -a rosey-voice-token
+#
+# Scales to zero when idle (this endpoint is only hit at wake time), so it
+# costs ~nothing at rest. First wake after a long idle eats a ~1-2s cold start.
+
+app = "rosey-voice-token"
+primary_region = "sjc"
+
+[build]
+
+[http_service]
+  internal_port = 8088
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

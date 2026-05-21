@@ -29,8 +29,11 @@ const CONFIG = {
   PORCUPINE_MODEL_PATH: "./models/porcupine_params.pv",
 
   // Backend that mints a short-lived OpenAI realtime client secret.
-  // NEVER put your OpenAI API key in this file. See server/session_server.py.
-  SESSION_ENDPOINT: "/session",
+  // NEVER put your OpenAI API key in this file. See voice-token-server/.
+  // Option A: the token server runs on its own small Fly app, so this is an
+  // absolute cross-origin URL (the server sends CORS headers for rosey.family).
+  // Update the app name here if you name the Fly app something else.
+  SESSION_ENDPOINT: "https://rosey-voice-token.fly.dev/session",
 
   REALTIME_MODEL: "gpt-realtime-2",
   // OpenAI WebRTC SDP exchange endpoint for voice-agent sessions.
