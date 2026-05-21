@@ -225,6 +225,36 @@ def test_add_reminder_roundtrip() -> None:
           "urg:" not in back, detail=back)
 
 
+def test_list_feeds() -> None:
+    FEED.parent.mkdir(parents=True, exist_ok=True)
+    FEED.write_text(
+        "## Individual Feeds\n"
+        "| Date | Time | Type | Amount | Duration | Pee | Poop | Notes |\n"
+        "|------|------|------|--------|----------|-----|------|-------|\n"
+        "| 2026-05-19 | 8:00 am  | Bottle | 1.5 oz         |         |   |   |   |\n"
+        "| 2026-05-19 | 10:40 pm | Bottle | ~35 mL + 15 mL |         |   |   |   |\n"
+        "| 2026-05-20 | 4:38 am  | BF-L   | ~1 oz          | 17 mins |   |   |   |\n"
+        "| 2026-05-20 | 10:58 am | Bottle | 15 mL          |         |   |   |   |\n"
+        "| 2026-05-20 | 3:00 pm  | Bottle | 0.5 oz         |         |   |   |   |\n"
+        "| 2026-05-20 | 5:20 pm  | —      | —              | —       | ✓ |   |   |\n",
+        encoding="utf-8",
+    )
+
+    day = mcp_server.list_feeds("2026-05-20")
+    check("list_feeds(day): count excludes the diaper row", "3 feeds" in day, detail=day)
+    check("list_feeds(day): day total ~2 oz (1 + 0.5 + 15mL)", "~2 oz" in day, detail=day)
+    check("list_feeds(day): still lists the diaper event", "diaper" in day.lower(), detail=day)
+
+    tot = mcp_server.list_feeds()
+    check("list_feeds(): daily-totals header", "daily feed totals" in tot.lower(), detail=tot)
+    check("list_feeds(): 5/19 sums oz + mL to ~3.2 oz", "3.2 oz" in tot, detail=tot)
+    check("list_feeds(): most recent day listed first",
+          tot.find("May 20") < tot.find("May 19"), detail=tot)
+
+    check("list_feeds(missing day): clean message",
+          "no feeds logged for" in mcp_server.list_feeds("2099-01-01").lower(), detail="")
+
+
 def test_add_reminder_no_time() -> None:
     REMINDERS.write_text("# Reminders\n\n", encoding="utf-8")
     before = REMINDERS.read_text(encoding="utf-8")
@@ -349,6 +379,7 @@ if __name__ == "__main__":
     test_feed_format_module()
     test_log_feed_table()
     test_amend_last_feed_tool()
+    test_list_feeds()
     test_add_reminder_roundtrip()
     test_add_reminder_no_time()
 

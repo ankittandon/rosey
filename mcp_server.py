@@ -615,6 +615,124 @@ def amend_last_feed(
     return f"Updated the last feed ({row.get('Date','')} {row.get('Time','')}): {_feed_summary(row)}."
 
 
+_OZ_PER_ML = 1 / 29.5735
+
+
+def _amount_oz(amount: str, ftype: str) -> float:
+    """Best-effort ounces for a feed row. Sums every 'N oz' / 'N mL' token
+    (so '~35 mL + 15 mL' works); falls back to ~1 oz for a breastfeed with no
+    stated volume, per the log's own convention."""
+    s = (amount or "").lower()
+    total = 0.0
+    found = False
+    for num, unit in re.findall(r"([\d.]+)\s*(oz|ml)", s):
+        try:
+            v = float(num)
+        except ValueError:
+            continue
+        found = True
+        total += v if unit == "oz" else v * _OZ_PER_ML
+    if not found:
+        return 1.0 if ftype.startswith("BF") else 0.0
+    return total
+
+
+def _round_oz(x: float):
+    r = round(x, 1)
+    return int(r) if r == int(r) else r
+
+
+def _pretty_date(d: date, today: date) -> str:
+    rel = (d - today).days
+    md = f"{d.strftime('%a %b')} {d.day}"
+    if rel == 0:
+        return f"Today ({md})"
+    if rel == -1:
+        return f"Yesterday ({md})"
+    if rel == 1:
+        return f"Tomorrow ({md})"
+    return md
+
+
+def _feed_day_target(day: str, today: date):
+    d = (day or "").strip().lower()
+    if not d:
+        return None
+    if d == "today":
+        return today
+    if d in ("yesterday", "yday"):
+        return today - timedelta(days=1)
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", d)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    m = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})", d)  # M/D, assume current year
+    if m:
+        try:
+            return date(today.year, int(m.group(1)), int(m.group(2)))
+        except ValueError:
+            return None
+    return None
+
+
+def _feed_line(row: dict) -> str:
+    if row.get("Type", "") in ("", "—"):
+        marks = [m for m, v in (("pee", row.get("Pee")), ("poop", row.get("Poop"))) if v]
+        return f"- {row.get('Time','')} — diaper" + (f" ({', '.join(marks)})" if marks else "")
+    bits = [row.get("Type", ""), row.get("Amount", ""), row.get("Duration", "")]
+    return f"- {row.get('Time','')} — " + ", ".join(b for b in bits if b and b != "—")
+
+
+@mcp.tool()
+def list_feeds(day: str = "") -> str:
+    """Summarize the baby's feeds from the shared feed log
+    (knowledge/baby_feed_log.md). Use this for ANY feed question — you CAN see
+    the log through this tool, so never say you can't.
+
+      - day="" (default) → per-day ounce totals for the last few days
+      - day="today" / "yesterday" / "YYYY-MM-DD" / "M/D" → that day's feeds
+        listed out, with the day's total.
+
+    Ounce totals sum oz + mL and assume ~1 oz for a breastfeed with no stated
+    volume; diaper-only rows are excluded from totals."""
+    content = _read(_FEED_LOG)
+    rows = [r for r in (feed_format.parse_row(l) for l in content.splitlines()
+                        if feed_format.is_data_row(l)) if r]
+    if not rows:
+        return "No feeds logged yet."
+
+    today = _local_now().date()
+    target = _feed_day_target(day, today)
+
+    if target is not None:
+        day_rows = [r for r in rows if r.get("Date") == target.isoformat()]
+        if not day_rows:
+            return f"No feeds logged for {_pretty_date(target, today)}."
+        feeds = [r for r in day_rows if r.get("Type") not in ("", "—")]
+        total = sum(_amount_oz(r.get("Amount", ""), r.get("Type", "")) for r in feeds)
+        head = (f"{_pretty_date(target, today)} — {len(feeds)} feeds, "
+                f"~{_round_oz(total)} oz total:")
+        return "\n".join([head] + [_feed_line(r) for r in day_rows])
+
+    # No day → per-day totals for the most recent days (file is chronological).
+    by_day: dict = {}
+    for r in rows:
+        by_day.setdefault(r.get("Date", ""), []).append(r)
+    recent = list(by_day.keys())[-4:]
+    out = ["Recent daily feed totals:"]
+    for ds in reversed(recent):
+        feeds = [r for r in by_day[ds] if r.get("Type") not in ("", "—")]
+        total = sum(_amount_oz(r.get("Amount", ""), r.get("Type", "")) for r in feeds)
+        try:
+            label = _pretty_date(date.fromisoformat(ds), today)
+        except ValueError:
+            label = ds or "(undated)"
+        out.append(f"- {label}: {len(feeds)} feeds, ~{_round_oz(total)} oz")
+    return "\n".join(out)
+
+
 if __name__ == "__main__":
     # Serves MCP over Streamable HTTP at /mcp on 0.0.0.0:MCP_PORT.
     mcp.run(transport="streamable-http")

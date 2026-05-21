@@ -59,7 +59,7 @@ const CONFIG = {
     "get_household", "remember",
     "list_grocery_items", "add_grocery_item",
     "list_reminders", "add_reminder",
-    "log_feed", "amend_last_feed",
+    "log_feed", "amend_last_feed", "list_feeds",
   ],
   // All of these are low-risk household actions, so auto-run them (no approval
   // prompt) for a smooth hands-free experience. When you add genuinely sensitive
@@ -68,7 +68,7 @@ const CONFIG = {
     "get_household", "remember",
     "list_grocery_items", "add_grocery_item",
     "list_reminders", "add_reminder",
-    "log_feed", "amend_last_feed",
+    "log_feed", "amend_last_feed", "list_feeds",
   ],
 
   // Lifecycle timings
@@ -89,6 +89,8 @@ const CONFIG = {
     "If the type or amount/duration is missing, ASK a brief question to confirm before " +
     "logging; never log a half-empty feed. The time defaults to now. To fix the feed you " +
     "just logged (e.g. 'there was poop too'), call amend_last_feed, don't log again. " +
+    "For ANY question about feeds (when, how much, daily totals) call list_feeds — you " +
+    "CAN see the feed log through it, so never say you can't. " +
     "Memory files can be long logs with timestamps and status notes. Do NOT read them " +
     "verbatim. Extract only what was asked: if asked for tomorrow's reminders, read just " +
     "tomorrow's, as a short spoken list of the task text (skip ids, timestamps, ack/escalation " +

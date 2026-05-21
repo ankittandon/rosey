@@ -35,7 +35,7 @@ MCP_ALLOWED_TOOLS = [
     "get_household", "remember",
     "list_grocery_items", "add_grocery_item",
     "list_reminders", "add_reminder",
-    "log_feed", "amend_last_feed",
+    "log_feed", "amend_last_feed", "list_feeds",
 ]
 MCP_AUTO_RUN_TOOLS = MCP_ALLOWED_TOOLS
 
@@ -50,6 +50,8 @@ SYSTEM_PROMPT = (
     "question to confirm BEFORE logging; never log a half-empty feed. The time defaults "
     "to now. To fix or add detail to the feed you just logged (e.g. 'there was poop "
     "too', 'it was 2 oz not 1'), call amend_last_feed instead of logging again. "
+    "For ANY question about feeds (when, how much, daily totals) call list_feeds — you "
+    "CAN see the feed log through it, so never say you can't. "
     "Memory files can be long logs with timestamps and status notes. Do NOT read them "
     "verbatim. Extract only what was asked: if asked for tomorrow's reminders, read just "
     "tomorrow's, as a short spoken list of the task text, skipping ids, timestamps, "
