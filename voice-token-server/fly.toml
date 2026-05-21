@@ -5,8 +5,8 @@
 #   fly secrets set ROSEY_PWA_ORIGIN=https://rosey.family  -a rosey-voice-token
 #   fly deploy -a rosey-voice-token
 #
-# Scales to zero when idle (this endpoint is only hit at wake time), so it
-# costs ~nothing at rest. First wake after a long idle eats a ~1-2s cold start.
+# Keep one tiny machine warm. This endpoint sits on the critical path between a
+# wake gesture and the first Realtime audio turn, so cold starts are noticeable.
 
 app = "rosey-voice-token"
 primary_region = "sjc"
@@ -16,9 +16,9 @@ primary_region = "sjc"
 [http_service]
   internal_port = 8088
   force_https = true
-  auto_stop_machines = "stop"
+  auto_stop_machines = "off"
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
 
 [[vm]]
   size = "shared-cpu-1x"

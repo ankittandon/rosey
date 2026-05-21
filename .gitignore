@@ -8,6 +8,8 @@ venv/
 .env
 .env.local
 memories/
+.wrangler/
+**/.wrangler/
 pii/
 household.toml
 .claude/
