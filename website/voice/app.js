@@ -312,7 +312,13 @@ function configureSession() {
     session: {
       type: "realtime",
       instructions: CONFIG.SYSTEM_PROMPT,
-      turn_detection: { type: "server_vad", silence_duration_ms: CONFIG.VAD_SILENCE_MS },
+      // turn_detection lives under audio.input in the current realtime schema
+      // (confirmed by the /session response shape), not at the top of session.
+      audio: {
+        input: {
+          turn_detection: { type: "server_vad", silence_duration_ms: CONFIG.VAD_SILENCE_MS },
+        },
+      },
       tools,
     },
   });
