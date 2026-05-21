@@ -71,8 +71,12 @@ const CONFIG = {
 
   SYSTEM_PROMPT:
     "You are Rosey, a warm, concise household assistant for this family. " +
-    "Answer from the household's shared memory via your tools. Keep replies short and spoken-friendly. " +
-    "When the user is clearly done (says thanks/bye, or there's nothing left to do), call end_conversation.",
+    "Always use your tools to actually fetch or change things before replying — " +
+    "if asked what's on the grocery list, CALL list_grocery_items and read back the " +
+    "real result; never say you'll 'check' or 'look into it' without calling the tool. " +
+    "Keep replies short and spoken-friendly. " +
+    "Only call end_conversation after you've fully answered AND the user signals " +
+    "they're done (thanks/bye). Never end in the same reply where you said you'd look something up.",
 };
 
 // ---------------------------------------------------------------------
@@ -368,15 +372,44 @@ function handleEvent(evt) {
       if (evt.name === "end_conversation") endSession("goodbye-tool");
       break;
 
-    // MCP approval gate for any tool not in MCP_AUTO_RUN_TOOLS.
+    // --- MCP lifecycle logging (so tool problems are visible, not silent) ---
+    case "mcp_list_tools.in_progress":
+      console.log("[mcp] importing tools from", CONFIG.MCP_SERVER_URL, "…");
+      break;
+    case "mcp_list_tools.completed":
+      console.log("[mcp] tools imported OK");
+      break;
+    case "mcp_list_tools.failed":
+      console.error("[mcp] TOOL IMPORT FAILED — server unreachable or bad /mcp endpoint:", evt);
+      break;
+    case "response.mcp_call_arguments.done":
+      console.log("[mcp] calling tool, args:", evt.arguments);
+      break;
+    case "response.mcp_call.in_progress":
+      console.log("[mcp] tool running…");
+      break;
+    case "response.mcp_call.failed":
+      console.error("[mcp] TOOL CALL FAILED:", evt);
+      break;
+
     case "conversation.item.done":
+      // Which tools actually loaded?
+      if (evt.item?.type === "mcp_list_tools") {
+        const names = (evt.item.tools || []).map((t) => t.name).join(", ");
+        console.log("[mcp] available tools:", names || "(NONE — that's the problem)");
+      }
+      // Approval gate for any tool not in MCP_AUTO_RUN_TOOLS.
       if (evt.item?.type === "mcp_approval_request") {
-        // For an unattended kitchen device, auto-approve known tools; otherwise
-        // you'd surface a confirm UI. Here we approve the allowed surface.
         send({
           type: "conversation.item.create",
           item: { type: "mcp_approval_response", approval_request_id: evt.item.id, approve: true },
         });
+      }
+      break;
+
+    case "response.output_item.done":
+      if (evt.item?.type === "mcp_call") {
+        console.log(`[mcp] ${evt.item.server_label}.${evt.item.name} ->`, evt.item.output);
       }
       break;
 
