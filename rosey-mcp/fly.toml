@@ -2,8 +2,10 @@
 # Deploy:
 #   fly apps create rosey-mcp                          # once
 #   fly volumes create rosey_mcp_data --size 1 -a rosey-mcp -r sjc   # once
-#   fly secrets set ROSEY_MCP_TOKEN=<optional-token>   -a rosey-mcp   # optional gate
 #   fly deploy -a rosey-mcp
+#
+# NOTE: this server is currently unauthenticated (see server.py). Fine for a
+# demo on a scratch memory dir; add auth before pointing it at real data.
 #
 # Unlike the token server, this stays warm (min 1 machine). The realtime model
 # calls these tools MID-conversation, so a cold start would fail the tool call

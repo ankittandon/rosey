@@ -23,11 +23,14 @@ TWO THINGS TO KNOW
    /data/memories). Running it standalone with its own volume gives you an
    isolated household — perfect for first tests, but not shared until co-located.
 
-2. AUTH: the realtime MCP tool config (server_url + authorization) is set in the
-   browser by the PWA, so any token there is visible to users — don't treat it
-   as strong auth. ROSEY_MCP_TOKEN adds a basic bearer gate, but for real
-   household data put this behind proper network controls / a server-side proxy.
-   For a personal demo on a scratch memory dir, leaving it open is acceptable.
+2. AUTH: this server is currently UNAUTHENTICATED — anyone with the URL can read
+   and write. That's acceptable for a personal demo pointed at a scratch memory
+   dir with an unguessable app name. It is NOT acceptable for real household
+   data. Before pointing MEMORY_ROOT at a live household, add auth — a bearer
+   check (e.g. a ROSEY_MCP_TOKEN gate via ASGI middleware) or a server-side
+   proxy in front. Note that the realtime MCP tool config (server_url +
+   authorization) is set in the browser by the PWA, so a client-passed token is
+   visible to users and isn't strong auth on its own.
 
 NOTE: the MCP Python SDK has moved quickly. If `mcp.run(transport=...)` or the
 streamable-http endpoint path differ in your installed `mcp` version, adjust to
