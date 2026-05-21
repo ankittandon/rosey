@@ -171,6 +171,8 @@ def test_parse_when() -> None:
         ("in 30 minutes",      datetime(2026, 5, 20, 10, 30)),
         ("in 2 hours",         datetime(2026, 5, 20, 12, 0)),
         ("in 3 days",          datetime(2026, 5, 23, 10, 0)),
+        ("20 minutes ago",     datetime(2026, 5, 20, 9, 40)),
+        ("2 hours ago",        datetime(2026, 5, 20, 8, 0)),
         ("2026-12-25 07:30",   datetime(2026, 12, 25, 7, 30)),
         ("2026-07-04",         datetime(2026, 7, 4, 9, 0)),    # date only → 9am
         ("3pm",                datetime(2026, 5, 20, 15, 0)),  # bare time, still ahead
@@ -221,6 +223,38 @@ def test_add_reminder_roundtrip() -> None:
           "urg:" not in back, detail=back)
 
 
+def test_log_feed() -> None:
+    from reminder_format import LINE_RE
+    feed = MEM / "knowledge" / "baby_feed_log.md"
+    feed.parent.mkdir(parents=True, exist_ok=True)
+    feed.write_text("", encoding="utf-8")
+    notes = MEM / "notes.md"
+    notes.write_text("", encoding="utf-8")
+
+    now = mcp_server._local_now()
+
+    # No time given → defaults to now, lands in the FEED log (not notes.md).
+    msg = mcp_server.log_feed(amount="1.5 oz", kind="bottle")
+    content = feed.read_text(encoding="utf-8")
+    check("log_feed: wrote to knowledge/baby_feed_log.md",
+          "bottle, 1.5 oz" in content, detail=content)
+    written = next((l for l in content.splitlines() if l.startswith("- [")), "")
+    check("log_feed: entry is a dated, parseable line",
+          bool(LINE_RE.match(written)), detail=repr(written))
+    check("log_feed: did NOT land in notes.md",
+          "1.5 oz" not in notes.read_text(encoding="utf-8"), detail=notes.read_text())
+    check("log_feed: confirmation names what was logged",
+          "bottle, 1.5 oz" in msg, detail=msg)
+
+    # Explicit fields + time.
+    feed.write_text("", encoding="utf-8")
+    mcp_server.log_feed(amount="1 oz", kind="BF-L", duration="25 mins", when="today 1:30pm")
+    line = feed.read_text(encoding="utf-8").strip()
+    expected = f"- [{now.date()} 13:30] BF-L, 1 oz, 25 mins"
+    check("log_feed: composes kind/amount/duration with the given time",
+          line == expected, detail=repr(line))
+
+
 def test_add_reminder_no_time() -> None:
     REMINDERS.write_text("# Reminders\n\n", encoding="utf-8")
     before = REMINDERS.read_text(encoding="utf-8")
@@ -243,6 +277,7 @@ if __name__ == "__main__":
     test_empty_day()
     test_empty_file()
     test_parse_when()
+    test_log_feed()
     test_add_reminder_roundtrip()
     test_add_reminder_no_time()
 

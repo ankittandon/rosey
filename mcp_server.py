@@ -217,6 +217,7 @@ _NAMED_TIMES = {
 # "3pm" / "3:30 pm"  OR  "14:30" (24-hour, no meridiem).
 _CLOCK_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*([ap]\.?\s?m\.?)\b|\b(\d{1,2}):(\d{2})\b")
 _REL_RE = re.compile(r"\bin\s+(\d+)\s*(minutes?|mins?|hours?|hrs?|days?|m|h|d)\b")
+_AGO_RE = re.compile(r"\b(\d+)\s*(minutes?|mins?|hours?|hrs?|days?|m|h|d)\s+ago\b")
 _ISO_DT_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})[ tT](\d{1,2}):(\d{2})\b")
 _ISO_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 
@@ -262,6 +263,20 @@ def _parse_when(when: str, now: datetime) -> datetime | None:
             )
         except ValueError:
             return None
+
+    # Relative-past: "30 minutes ago", "2 hours ago" (handy for logging a feed
+    # that already happened). Checked before the forward "in N" form.
+    m = _AGO_RE.search(s)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)[0]
+        base = now.replace(second=0, microsecond=0)
+        if unit == "m":
+            return base - timedelta(minutes=n)
+        if unit == "h":
+            return base - timedelta(hours=n)
+        if unit == "d":
+            return base - timedelta(days=n)
 
     # Relative: "in 30 minutes", "in 2 hours", "in 3 days".
     m = _REL_RE.search(s)
@@ -434,9 +449,47 @@ def add_reminder(text: str, when: str = "") -> str:
 
 @mcp.tool()
 def remember(note: str) -> str:
-    """Save a durable note to the household's shared memory."""
+    """Save a durable, general note to the household's shared memory. For a baby
+    feeding, use `log_feed` instead so it lands in the feed log."""
     _append("notes.md", f"- {datetime.now().date().isoformat()}: {note}")
     return "Saved to household memory."
+
+
+@mcp.tool()
+def log_feed(
+    amount: str = "",
+    kind: str = "",
+    duration: str = "",
+    when: str = "",
+    notes: str = "",
+) -> str:
+    """Record a baby feeding in the household's shared FEED LOG
+    (knowledge/baby_feed_log.md) — the same file the chat assistant reads when
+    asked "when was the last feed?". Use this (not `remember`) for any feeding,
+    so it shows up across every channel.
+
+    Fields are all optional; include what you know:
+      amount   — how much, e.g. "1.5 oz", "30 ml"
+      kind     — type, e.g. "bottle", "breastfeed left"/"BF-L", "formula", "solids"
+      duration — how long, e.g. "25 mins"
+      when     — when it happened; DEFAULTS TO NOW. Accepts "now", "1:30pm",
+                 "today 2pm", "20 minutes ago", "YYYY-MM-DD HH:MM".
+      notes    — anything else worth recording.
+    """
+    now = _local_now()
+    dt = _parse_when(when, now) if when.strip() else now
+    if dt is None:
+        dt = now
+    ts = dt.strftime("%Y-%m-%d %H:%M")
+
+    detail = ", ".join(p.strip() for p in (kind, amount, duration) if p and p.strip())
+    detail = detail or "feed"
+    line = f"- [{ts}] {detail}"
+    if notes.strip():
+        line += f" — {notes.strip()}"
+    _append("knowledge/baby_feed_log.md", line)
+
+    return f"Logged feed: {detail} at {_fmt_time(dt)} ({_date_label(dt.date(), now.date())})."
 
 
 if __name__ == "__main__":

@@ -1,9 +1,10 @@
 // Rosey wake-word PWA
 // =====================================================================
-// Flow:  ASLEEP (waiting for wake) -> wake -> open WebRTC Realtime session
-//          (gpt-realtime-2) -> converse, with Rosey's tools attached as a
-//          remote MCP server -> graceful end (VAD silence + follow-up window +
-//          end_conversation tool + hard timeout) -> close session -> ASLEEP.
+// Flow:  ASLEEP (waiting for wake) -> wake -> mint a configured OpenAI session
+//          -> open WebRTC Realtime session (gpt-realtime-2) -> wait for tools
+//          -> converse, with Rosey's tools attached as a remote MCP server
+//          -> graceful end (VAD silence + follow-up window + hard timeout)
+//          -> close session -> ASLEEP.
 //
 // The paid OpenAI session only spans wake -> graceful-close (~20-60s).
 //
@@ -58,6 +59,7 @@ const CONFIG = {
     "get_household", "remember",
     "list_grocery_items", "add_grocery_item",
     "list_reminders", "add_reminder",
+    "log_feed",
   ],
   // All of these are low-risk household actions, so auto-run them (no approval
   // prompt) for a smooth hands-free experience. When you add genuinely sensitive
@@ -66,17 +68,24 @@ const CONFIG = {
     "get_household", "remember",
     "list_grocery_items", "add_grocery_item",
     "list_reminders", "add_reminder",
+    "log_feed",
   ],
 
   // Lifecycle timings
   FOLLOWUP_WINDOW_MS: 8000,   // after Rosey replies, keep listening this long for a follow-up
   HARD_TIMEOUT_MS: 90000,     // absolute cap on a single wake session (cost insurance)
-  VAD_SILENCE_MS: 1500,       // server VAD: silence that ends a user turn
+  READY_TIMEOUT_MS: 5000,     // don't stay muted forever if tool setup fails
+  VAD_SILENCE_MS: 650,        // fallback only; token server owns the real value
+  WAKE_TRANSCRIPT_RE: /\b(rosey|rosie|rozey|rosy)\b/i,
+  WAKE_WORD_ONLY_RE: /\b(rosey|rosie|rozey|rosy)\b/gi,
 
   SYSTEM_PROMPT:
     "You are Rosey, a warm, concise household assistant for this family. " +
-    "Call your tools to fetch or change things, then ANSWER in the SAME turn — " +
-    "don't say 'let me check' as a standalone reply; just look it up and give the answer. " +
+    "For tool-backed questions, call the needed tool silently before speaking. " +
+    "Do not say 'let me check', 'one moment', or similar filler as a standalone reply. " +
+    "Fetch or change the thing, then answer in the same turn. " +
+    "To record a baby feeding, call log_feed (NOT remember) so it lands in the shared " +
+    "feed log; default the time to now unless the user gives one. " +
     "Memory files can be long logs with timestamps and status notes. Do NOT read them " +
     "verbatim. Extract only what was asked: if asked for tomorrow's reminders, read just " +
     "tomorrow's, as a short spoken list of the task text (skip ids, timestamps, ack/escalation " +
@@ -91,11 +100,21 @@ let state = "boot";
 let porcupine = null;
 let pc = null;              // RTCPeerConnection for the active session
 let dc = null;             // data channel for realtime events
+let micTrack = null;
 let remoteAudioEl = null;
 let followupTimer = null;
 let hardTimer = null;
+let readyTimer = null;
 let started = false;
 let wakeLock = null;
+let realtimeReady = false;
+let expectMcpTools = false;
+let serverConfiguredSession = false;
+let responseActive = false;
+let wakeInterruptSent = false;
+let pendingResponseAfterCancel = false;
+let inputTranscripts = new Map();
+let respondedInputItems = new Set();
 
 const els = {
   body: document.body,
@@ -238,8 +257,15 @@ async function onWake() {
 // Realtime session (WebRTC -> gpt-realtime-2)
 // ---------------------------------------------------------------------
 async function openSession() {
-  setState(STATE.LISTENING, "Listening…");
+  setState(STATE.THINKING, "Waking Rosey…");
   setTranscript("");
+  realtimeReady = false;
+  expectMcpTools = false;
+  serverConfiguredSession = false;
+  responseActive = false;
+  wakeInterruptSent = false;
+  pendingResponseAfterCancel = false;
+  respondedInputItems.clear();
 
   try {
     // 1) Mint a short-lived client secret from our backend.
@@ -256,6 +282,10 @@ async function openSession() {
     const ephemeralKey =
       secret.value || secret.client_secret?.value || secret.client_secret;
     if (!ephemeralKey) throw new Error("no ephemeral key in /session response");
+    const session = secret.session || {};
+    const sessionTools = session.tools || [];
+    serverConfiguredSession = !!session.instructions || sessionTools.length > 0;
+    expectMcpTools = sessionTools.some((t) => t.type === "mcp") || mcpConfigured();
 
     // 2) Capture mic and set up the peer connection.
     // Echo cancellation is critical: without it, on a device with speaker+mic
@@ -264,8 +294,10 @@ async function openSession() {
     const mic = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
+    micTrack = mic.getAudioTracks()[0];
+    micTrack.enabled = false;
     pc = new RTCPeerConnection();
-    pc.addTrack(mic.getAudioTracks()[0], mic);
+    pc.addTrack(micTrack, mic);
 
     remoteAudioEl = remoteAudioEl || new Audio();
     remoteAudioEl.autoplay = true;
@@ -273,7 +305,15 @@ async function openSession() {
 
     // 3) Data channel for realtime events.
     dc = pc.createDataChannel("oai-events");
-    dc.onopen = () => configureSession();
+    dc.onopen = () => {
+      if (serverConfiguredSession) {
+        setState(STATE.THINKING, expectMcpTools ? "Loading Rosey's tools…" : "Almost ready…");
+        if (!expectMcpTools) markRealtimeReady("data-channel-open");
+      } else {
+        configureSession();
+      }
+      armReadyTimeout();
+    };
     dc.onmessage = (e) => handleEvent(JSON.parse(e.data));
 
     // 4) SDP offer/answer with OpenAI.
@@ -331,17 +371,22 @@ function configureSession() {
     session: {
       type: "realtime",
       instructions: CONFIG.SYSTEM_PROMPT,
-      // turn_detection lives under audio.input in the current realtime schema
-      // (confirmed by the /session response shape), not at the top of session.
+      // Fallback for older token servers. The deployed token server now creates
+      // sessions with this config already attached, which avoids first-turn tool
+      // loading races.
       audio: {
         input: {
-          // interrupt_response:false — don't let detected speech (including echo of
-      // Rosey's own voice on speaker+mic setups) cut off her reply mid-sentence.
-      turn_detection: {
-        type: "server_vad",
-        silence_duration_ms: CONFIG.VAD_SILENCE_MS,
-        interrupt_response: false,
-      },
+          turn_detection: {
+            type: "server_vad",
+            silence_duration_ms: CONFIG.VAD_SILENCE_MS,
+            create_response: false,
+            interrupt_response: false,
+          },
+          transcription: {
+            model: "gpt-4o-mini-transcribe",
+            language: "en",
+            prompt: "Listen for the wake word Rosey, also commonly transcribed as Rosie.",
+          },
         },
       },
       tools,
@@ -351,13 +396,102 @@ function configureSession() {
 
 function send(obj) { if (dc && dc.readyState === "open") dc.send(JSON.stringify(obj)); }
 
+function setMicEnabled(enabled) {
+  if (micTrack) micTrack.enabled = enabled;
+}
+
+function markRealtimeReady(reason) {
+  if (realtimeReady) return;
+  realtimeReady = true;
+  clearTimeout(readyTimer);
+  setMicEnabled(true);
+  console.log("realtime ready:", reason);
+  setState(STATE.LISTENING, "Listening…");
+}
+
+function armReadyTimeout() {
+  clearTimeout(readyTimer);
+  readyTimer = setTimeout(() => {
+    if (!realtimeReady) {
+      console.warn("Realtime setup still pending; enabling mic so the session is not stuck.");
+      markRealtimeReady("ready-timeout");
+    }
+  }, CONFIG.READY_TIMEOUT_MS);
+}
+
+function isTranscriptionPromptEcho(transcript) {
+  return /^\s*listen for the wake word rosey\b/i.test(transcript || "");
+}
+
+function hasWakeWord(transcript) {
+  return CONFIG.WAKE_TRANSCRIPT_RE.test(transcript || "");
+}
+
+function commandAfterWakeWord(transcript) {
+  return (transcript || "")
+    .replace(CONFIG.WAKE_WORD_ONLY_RE, " ")
+    .replace(/\b(hey|hi|hello|okay|ok)\b/gi, " ")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function createResponse(reason) {
+  if (responseActive || !realtimeReady) return false;
+  console.log("creating response:", reason);
+  send({ type: "response.create" });
+  return true;
+}
+
+function maybeWakeInterrupt(transcript) {
+  if (!responseActive || wakeInterruptSent || !transcript) return false;
+  if (isTranscriptionPromptEcho(transcript) || !hasWakeWord(transcript)) return false;
+
+  wakeInterruptSent = true;
+  pendingResponseAfterCancel = commandAfterWakeWord(transcript).length > 0;
+  clearTimeout(followupTimer);
+  console.log("wake-word interrupt:", transcript);
+  send({ type: "response.cancel" });
+  setTranscript("");
+  setState(STATE.LISTENING, "Listening…");
+  return true;
+}
+
+function rememberInputTranscript(evt) {
+  const itemId = evt.item_id || "_latest";
+  const next = evt.transcript || ((inputTranscripts.get(itemId) || "") + (evt.delta || ""));
+  inputTranscripts.set(itemId, next);
+  if (evt.type === "conversation.item.input_audio_transcription.delta") {
+    maybeWakeInterrupt(next);
+  }
+  return { itemId, transcript: next };
+}
+
+function maybeRespondToCompletedInput(evt) {
+  const { itemId, transcript } = rememberInputTranscript(evt);
+  if (respondedInputItems.has(itemId) || isTranscriptionPromptEcho(transcript)) return;
+
+  if (responseActive) {
+    if (maybeWakeInterrupt(transcript)) respondedInputItems.add(itemId);
+    return;
+  }
+
+  if (!commandAfterWakeWord(transcript)) return;
+  if (createResponse(`input:${itemId}`)) respondedInputItems.add(itemId);
+}
+
 // ---------------------------------------------------------------------
 // Realtime event handling
 // ---------------------------------------------------------------------
 function handleEvent(evt) {
   switch (evt.type) {
+    case "session.updated":
+      if (!expectMcpTools) markRealtimeReady("session-updated");
+      break;
+
     case "input_audio_buffer.speech_started":
       clearTimeout(followupTimer);
+      inputTranscripts.clear();
       setState(STATE.LISTENING, "Listening…");
       break;
 
@@ -366,6 +500,8 @@ function handleEvent(evt) {
       // tool result). Cancel any pending follow-up/sleep timer so we don't
       // end the session mid-answer during a tool round-trip.
       clearTimeout(followupTimer);
+      responseActive = true;
+      wakeInterruptSent = false;
       setState(STATE.THINKING, "…");
       break;
 
@@ -377,8 +513,22 @@ function handleEvent(evt) {
     // A turn finished. Open a short follow-up window; if the user stays
     // silent past it, gracefully end.
     case "response.done":
+      responseActive = false;
+      if (pendingResponseAfterCancel) {
+        pendingResponseAfterCancel = false;
+        createResponse("wake-word-after-cancel");
+        break;
+      }
       setState(STATE.LISTENING, "Anything else?");
       armFollowupWindow();
+      break;
+
+    case "conversation.item.input_audio_transcription.delta":
+      rememberInputTranscript(evt);
+      break;
+
+    case "conversation.item.input_audio_transcription.completed":
+      maybeRespondToCompletedInput(evt);
       break;
 
     // --- MCP lifecycle logging (so tool problems are visible, not silent) ---
@@ -387,9 +537,11 @@ function handleEvent(evt) {
       break;
     case "mcp_list_tools.completed":
       console.log("[mcp] tools imported OK");
+      markRealtimeReady("mcp-tools-loaded");
       break;
     case "mcp_list_tools.failed":
       console.error("[mcp] TOOL IMPORT FAILED — server unreachable or bad /mcp endpoint:", evt);
+      markRealtimeReady("mcp-tools-failed");
       break;
     case "response.mcp_call_arguments.done":
       console.log("[mcp] calling tool, args:", evt.arguments);
@@ -441,6 +593,7 @@ function armFollowupWindow() {
 async function endSession(reason) {
   clearTimeout(followupTimer);
   clearTimeout(hardTimer);
+  clearTimeout(readyTimer);
   console.log("ending session:", reason);
   sleepChime();
   setTranscript("");
@@ -452,7 +605,15 @@ async function endSession(reason) {
       pc.close();
     }
   } catch (e) {}
-  pc = null; dc = null;
+  pc = null; dc = null; micTrack = null;
+  realtimeReady = false;
+  expectMcpTools = false;
+  serverConfiguredSession = false;
+  responseActive = false;
+  wakeInterruptSent = false;
+  pendingResponseAfterCancel = false;
+  inputTranscripts.clear();
+  respondedInputItems.clear();
 
   // Resume free on-device wake-word listening.
   await startWakeWord();

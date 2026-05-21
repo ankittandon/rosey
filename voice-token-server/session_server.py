@@ -25,7 +25,33 @@ app = Flask(__name__)
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 CLIENT_SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets"
-DEFAULT_MODEL = "gpt-realtime-2"
+DEFAULT_MODEL = os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime-2")
+TRANSCRIPTION_MODEL = os.environ.get("OPENAI_REALTIME_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe")
+VAD_SILENCE_MS = int(os.environ.get("OPENAI_REALTIME_VAD_SILENCE_MS", "650"))
+
+MCP_SERVER_LABEL = os.environ.get("ROSEY_MCP_SERVER_LABEL", "rosey")
+MCP_SERVER_URL = os.environ.get("ROSEY_MCP_SERVER_URL", "https://rosey.fly.dev/mcp")
+MCP_ALLOWED_TOOLS = [
+    "get_household", "remember",
+    "list_grocery_items", "add_grocery_item",
+    "list_reminders", "add_reminder",
+    "log_feed",
+]
+MCP_AUTO_RUN_TOOLS = MCP_ALLOWED_TOOLS
+
+SYSTEM_PROMPT = (
+    "You are Rosey, a warm, concise household assistant for this family. "
+    "For tool-backed questions, call the needed tool silently before speaking. "
+    "Do not say 'let me check', 'one moment', or similar filler as a standalone reply. "
+    "Fetch or change the thing, then answer in the same turn. "
+    "To record a baby feeding, call log_feed (NOT remember) so it lands in the shared "
+    "feed log; default the time to now unless the user gives one. "
+    "Memory files can be long logs with timestamps and status notes. Do NOT read them "
+    "verbatim. Extract only what was asked: if asked for tomorrow's reminders, read just "
+    "tomorrow's, as a short spoken list of the task text, skipping ids, timestamps, "
+    "acknowledgement/escalation metadata, and other machine tags. Keep replies short, "
+    "spoken-friendly, and finish your sentences fully."
+)
 
 # Lock this to your PWA origin in production.
 ALLOWED_ORIGIN = os.environ.get("ROSEY_PWA_ORIGIN", "*")
@@ -51,13 +77,45 @@ def create_session():
     body = request.get_json(silent=True) or {}
     model = body.get("model", DEFAULT_MODEL)
 
-    # Mint the ephemeral client secret. The session's tools/instructions can be
-    # set here, or (as the PWA does) via session.update once the data channel
-    # opens. Keeping it minimal here; the PWA configures tools client-side.
+    tools = []
+    if MCP_SERVER_URL:
+        tools.append({
+            "type": "mcp",
+            "server_label": MCP_SERVER_LABEL,
+            "server_url": MCP_SERVER_URL,
+            "allowed_tools": MCP_ALLOWED_TOOLS,
+            "require_approval": "never"
+            if len(MCP_AUTO_RUN_TOOLS) == len(MCP_ALLOWED_TOOLS)
+            else {"never": {"tool_names": MCP_AUTO_RUN_TOOLS}},
+        })
+
+    # Mint the ephemeral client secret with the full session config already
+    # attached. This lets Realtime start loading MCP tools before the browser's
+    # first audio turn, avoiding the "let me check" then silence race.
     payload = {
         "session": {
             "type": "realtime",
             "model": model,
+            "instructions": SYSTEM_PROMPT,
+            "audio": {
+                "input": {
+                    "transcription": {
+                        "model": TRANSCRIPTION_MODEL,
+                        "language": "en",
+                        "prompt": "Listen for the wake word Rosey, also commonly transcribed as Rosie.",
+                    },
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "silence_duration_ms": VAD_SILENCE_MS,
+                        "create_response": False,
+                        # Alexa-style barge-in is handled client-side: regular
+                        # speech does not interrupt, but the wake word "Rosey"
+                        # cancels the current response and queues the next one.
+                        "interrupt_response": False,
+                    },
+                },
+            },
+            "tools": tools,
             # Optionally pin a safety identifier (hashed household/user id):
             # "safety_identifier": "household-<hashed-id>",
         }
