@@ -116,6 +116,7 @@ let realtimeReady = false;
 let expectMcpTools = false;
 let serverConfiguredSession = false;
 let responseActive = false;
+let responsePending = false;   // response.create sent, response.created not yet seen
 let wakeInterruptSent = false;
 let pendingResponseAfterCancel = false;
 let inputTranscripts = new Map();
@@ -268,8 +269,10 @@ async function openSession() {
   expectMcpTools = false;
   serverConfiguredSession = false;
   responseActive = false;
+  responsePending = false;
   wakeInterruptSent = false;
   pendingResponseAfterCancel = false;
+  inputTranscripts.clear();
   respondedInputItems.clear();
 
   try {
@@ -425,7 +428,14 @@ function armReadyTimeout() {
 }
 
 function isTranscriptionPromptEcho(transcript) {
-  return /^\s*listen for the wake word rosey\b/i.test(transcript || "");
+  // The session's transcription prompt ("Listen for the wake word Rosey, also
+  // commonly transcribed as Rosie") gets regurgitated as a phantom transcript on
+  // silence/noise. Drop anything that looks like it so it can't masquerade as a
+  // wake-word interrupt or a command (which would cancel an in-flight tool call).
+  const t = (transcript || "").toLowerCase();
+  return /listen for the wake word/.test(t)
+      || /wake word\s+ros/.test(t)
+      || /commonly transcribed as ros/.test(t);
 }
 
 function hasWakeWord(transcript) {
@@ -442,7 +452,12 @@ function commandAfterWakeWord(transcript) {
 }
 
 function createResponse(reason) {
-  if (responseActive || !realtimeReady) return false;
+  // Guard on responsePending too: responseActive only flips true when the
+  // response.created event arrives (a round-trip later), so without this a
+  // second create fired in that window slips through and the server rejects it
+  // with conversation_already_has_active_response.
+  if (responseActive || responsePending || !realtimeReady) return false;
+  responsePending = true;
   console.log("creating response:", reason);
   send({ type: "response.create" });
   return true;
@@ -506,7 +521,9 @@ function handleEvent(evt) {
       // end the session mid-answer during a tool round-trip.
       clearTimeout(followupTimer);
       responseActive = true;
+      responsePending = false;   // the create we sent has landed
       wakeInterruptSent = false;
+      setTranscript("");         // start each spoken response fresh (no run-together)
       setState(STATE.THINKING, "…");
       break;
 
@@ -519,6 +536,7 @@ function handleEvent(evt) {
     // silent past it, gracefully end.
     case "response.done":
       responseActive = false;
+      responsePending = false;
       if (pendingResponseAfterCancel) {
         pendingResponseAfterCancel = false;
         createResponse("wake-word-after-cancel");
@@ -583,6 +601,10 @@ function handleEvent(evt) {
 
     case "error":
       console.error("realtime error", evt);
+      // A failed create (e.g. conversation_already_has_active_response) won't
+      // emit response.created/done, so clear the pending flag — otherwise the
+      // client wedges and can't create any further responses.
+      responsePending = false;
       break;
   }
 }
