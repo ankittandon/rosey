@@ -1,28 +1,34 @@
 // Rosey wake-word PWA
 // =====================================================================
-// Flow:  ASLEEP (Porcupine listens on-device, free)
-//          -> hears "Rosey" -> open WebRTC Realtime session (gpt-realtime-2)
-//          -> converse, with Rosey's tools attached as a remote MCP server
-//          -> graceful end (VAD silence + follow-up window + end_conversation
-//             tool + hard timeout) -> close session -> ASLEEP again.
+// Flow:  ASLEEP (waiting for wake) -> wake -> open WebRTC Realtime session
+//          (gpt-realtime-2) -> converse, with Rosey's tools attached as a
+//          remote MCP server -> graceful end (VAD silence + follow-up window +
+//          end_conversation tool + hard timeout) -> close session -> ASLEEP.
 //
 // The paid OpenAI session only spans wake -> graceful-close (~20-60s).
-// Everything before/after is free on-device wake-word listening.
 //
-// SETUP (fill these in — see CONFIG below):
-//   1. Picovoice access key + a custom "Rosey" keyword file (Rosey.ppn).
-//      Generate at https://console.picovoice.ai  (free tier).
-//      Drop Rosey.ppn and porcupine_params.pv into voice-pwa/models/.
-//   2. SESSION_ENDPOINT: deploy server/session_server.py somewhere (e.g. your
-//      Fly app) so the OpenAI API key never lives in the browser.
-//   3. MCP_SERVER_URL: your Rosey MCP server (the adapter that exposes
-//      memory/reminders/grocery as MCP tools). allowed_tools narrows the surface.
+// WAKE ENGINE — choose how Rosey wakes (CONFIG.WAKE_ENGINE):
+//   "tap"        Tap the orb to wake. Zero dependencies, fully private.
+//                Best for first tests and demos. Always available as override.
+//   "webspeech"  Say "Rosey". Uses the browser SpeechRecognition API — works
+//                today with no signup, BUT streams ambient audio to the
+//                browser's STT (Google on Chrome). NOT on-device; a stopgap,
+//                not for the privacy-first brand story.
+//   "porcupine"  Say "Rosey", fully on-device. Requires a Picovoice AccessKey
+//                + Rosey.ppn (their console is gated behind approval as of now).
+//                Kept ready: set the key + drop the model files, flip the flag.
+//
+// SETUP:
+//   1. SESSION_ENDPOINT: the Fly token server (mints OpenAI client secrets so
+//      the API key never lives in the browser). Already deployed.
+//   2. MCP_SERVER_URL: your Rosey MCP adapter (memory/reminders/grocery). Until
+//      set, Rosey talks but can't touch household state.
 // =====================================================================
 
-import { PorcupineWorker } from "https://cdn.jsdelivr.net/npm/@picovoice/porcupine-web@3.0.3/dist/iife/index.js";
-import { WebVoiceProcessor } from "https://cdn.jsdelivr.net/npm/@picovoice/web-voice-processor@4.0.9/dist/iife/index.js";
-
 const CONFIG = {
+  // "tap" | "webspeech" | "porcupine"
+  WAKE_ENGINE: "tap",
+
   WAKE_WORD_LABEL: "Rosey",
   PICOVOICE_ACCESS_KEY: "<YOUR_PICOVOICE_ACCESS_KEY>",
   PORCUPINE_KEYWORD_PATH: "./models/Rosey.ppn",     // custom keyword from Picovoice console
@@ -125,31 +131,87 @@ document.addEventListener("visibilitychange", () => {
 });
 
 // ---------------------------------------------------------------------
-// Wake-word listening (on-device, free)
+// Wake — dispatches on CONFIG.WAKE_ENGINE. The rest of the app only cares
+// about onWake(); swapping engines never touches realtime/lifecycle code.
 // ---------------------------------------------------------------------
+let speechRec = null;   // Web Speech recognizer (webspeech engine)
+let wvp = null;         // Picovoice WebVoiceProcessor (porcupine engine)
+let wakeActive = false; // armed to detect a wake?
+
 async function startWakeWord() {
+  wakeActive = true;
+  if (CONFIG.WAKE_ENGINE === "porcupine") return startPorcupine();
+  if (CONFIG.WAKE_ENGINE === "webspeech") return startWebSpeech();
+  // "tap": nothing to listen for — tapping the orb calls onWake() (see boot).
+  setState(STATE.ASLEEP, "Tap the circle to talk to Rosey");
+}
+
+async function stopWakeWord() {
+  wakeActive = false;
+  if (CONFIG.WAKE_ENGINE === "porcupine") return stopPorcupine();
+  if (CONFIG.WAKE_ENGINE === "webspeech") return stopWebSpeech();
+}
+
+// --- webspeech engine: browser SpeechRecognition (NOT on-device) ---
+function startWebSpeech() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { setState(STATE.ERROR, "No SpeechRecognition here — use tap mode."); return; }
+  speechRec = new SR();
+  speechRec.continuous = true;
+  speechRec.interimResults = true;
+  speechRec.lang = "en-US";
+  speechRec.onresult = (e) => {
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const t = e.results[i][0].transcript.toLowerCase();
+      if (t.includes(CONFIG.WAKE_WORD_LABEL.toLowerCase())) { onWake(); return; }
+    }
+  };
+  // SpeechRecognition stops itself periodically; restart while armed.
+  speechRec.onend = () => {
+    if (wakeActive && CONFIG.WAKE_ENGINE === "webspeech") {
+      try { speechRec.start(); } catch (e) {}
+    }
+  };
+  speechRec.onerror = (e) => {
+    if (e.error === "not-allowed") setState(STATE.ERROR, "Mic blocked — allow mic & reload.");
+  };
+  try { speechRec.start(); } catch (e) {}
+  setState(STATE.ASLEEP, 'Say "Rosey" — or tap the circle');
+}
+
+function stopWebSpeech() {
+  try { if (speechRec) { speechRec.onend = null; speechRec.stop(); } } catch (e) {}
+  speechRec = null;
+}
+
+// --- porcupine engine: on-device keyword (needs Picovoice approval) ---
+async function startPorcupine() {
+  const [{ PorcupineWorker }, { WebVoiceProcessor }] = await Promise.all([
+    import("https://cdn.jsdelivr.net/npm/@picovoice/porcupine-web@3.0.3/dist/iife/index.js"),
+    import("https://cdn.jsdelivr.net/npm/@picovoice/web-voice-processor@4.0.9/dist/iife/index.js"),
+  ]);
+  wvp = WebVoiceProcessor;
   porcupine = await PorcupineWorker.create(
     CONFIG.PICOVOICE_ACCESS_KEY,
     { label: CONFIG.WAKE_WORD_LABEL, publicPath: CONFIG.PORCUPINE_KEYWORD_PATH },
     onWake,
     { publicPath: CONFIG.PORCUPINE_MODEL_PATH }
   );
-  await WebVoiceProcessor.subscribe(porcupine);
+  await wvp.subscribe(porcupine);
   setState(STATE.ASLEEP, 'Say "Rosey" to wake me');
 }
 
-async function stopWakeWord() {
-  try { await WebVoiceProcessor.unsubscribe(porcupine); } catch (e) {}
+async function stopPorcupine() {
+  try { if (wvp && porcupine) await wvp.unsubscribe(porcupine); } catch (e) {}
   try { porcupine && porcupine.release(); } catch (e) {}
   porcupine = null;
 }
 
-// Porcupine fires this when it hears "Rosey".
+// Any engine (or an orb tap) calls this to wake.
 async function onWake() {
   if (state === STATE.LISTENING || state === STATE.THINKING) return; // already awake
   wakeChime();
-  // Release the mic from Porcupine before WebRTC grabs it (avoid contention).
-  await stopWakeWord();
+  await stopWakeWord();   // release the mic before WebRTC grabs it
   await openSession();
 }
 
@@ -352,6 +414,13 @@ els.startBtn.addEventListener("click", async () => {
     started = false;
     els.startBtn.hidden = false;
   }
+});
+
+// Tap-to-talk: tapping the orb wakes Rosey from sleep. This is the entire
+// interaction in "tap" mode, and a manual override in the wake-word modes.
+// The tap itself is the user gesture that unlocks mic capture. Ignored mid-call.
+document.getElementById("orb").addEventListener("click", () => {
+  if (started && state === STATE.ASLEEP) onWake();
 });
 
 if ("serviceWorker" in navigator) {
