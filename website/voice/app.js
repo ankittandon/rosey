@@ -46,12 +46,23 @@ const CONFIG = {
   // Confirm against the WebRTC guide before shipping.
   REALTIME_CALLS_URL: "https://api.openai.com/v1/realtime/calls",
 
-  // Rosey's tools, exposed as a remote MCP server. Keep the surface narrow.
+  // Rosey's tools, exposed as a remote MCP server (rosey-mcp/). Tool names
+  // must match server.py. Keep the surface narrow.
   MCP_SERVER_LABEL: "rosey",
-  MCP_SERVER_URL: "<YOUR_ROSEY_MCP_SERVER_URL>",
-  MCP_ALLOWED_TOOLS: ["memory_read", "memory_write", "add_grocery_item", "add_reminder", "list_reminders"],
-  // Auto-run reads; gate writes/sends. Tools NOT listed here default to requiring approval.
-  MCP_AUTO_RUN_TOOLS: ["memory_read", "list_reminders"],
+  MCP_SERVER_URL: "https://rosey-mcp.fly.dev/mcp",
+  MCP_ALLOWED_TOOLS: [
+    "get_household", "remember",
+    "list_grocery_items", "add_grocery_item",
+    "list_reminders", "add_reminder",
+  ],
+  // All of these are low-risk household actions, so auto-run them (no approval
+  // prompt) for a smooth hands-free experience. When you add genuinely sensitive
+  // tools later (e.g. send_message), leave them OUT of AUTO_RUN so they gate.
+  MCP_AUTO_RUN_TOOLS: [
+    "get_household", "remember",
+    "list_grocery_items", "add_grocery_item",
+    "list_reminders", "add_reminder",
+  ],
 
   // Lifecycle timings
   FOLLOWUP_WINDOW_MS: 4000,   // after Rosey replies, keep listening this long for a follow-up

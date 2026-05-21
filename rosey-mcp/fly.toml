@@ -1,0 +1,34 @@
+# Fly config for the Rosey MCP adapter.
+# Deploy:
+#   fly apps create rosey-mcp                          # once
+#   fly volumes create rosey_mcp_data --size 1 -a rosey-mcp -r sjc   # once
+#   fly secrets set ROSEY_MCP_TOKEN=<optional-token>   -a rosey-mcp   # optional gate
+#   fly deploy -a rosey-mcp
+#
+# Unlike the token server, this stays warm (min 1 machine). The realtime model
+# calls these tools MID-conversation, so a cold start would fail the tool call
+# and break the turn. ~$2/mo is worth the reliability.
+#
+# MEMORY_ROOT defaults to /data/memories (the mounted volume below) — an ISOLATED
+# household. To SHARE state with your live WhatsApp Rosey, point this at that
+# household's actual memory volume instead (co-locate, don't run standalone).
+
+app = "rosey-mcp"
+primary_region = "sjc"
+
+[build]
+
+[http_service]
+  internal_port = 8089
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[mounts]
+  source = "rosey_mcp_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

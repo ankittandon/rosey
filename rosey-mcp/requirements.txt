@@ -1,0 +1,5 @@
+# The MCP Python SDK includes FastMCP + the Streamable HTTP server (starlette/
+# uvicorn come in as deps). The SDK moves fast — if the streamable-http transport
+# API differs in the version that resolves here, pin/adjust accordingly.
+mcp>=1.9
+uvicorn>=0.30
