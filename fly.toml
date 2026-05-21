@@ -25,6 +25,13 @@ primary_region = 'sjc'
 # 404 and the implicit check would fail forever. Defining the service
 # explicitly lets us use a TCP-only check that just verifies port 8080 is
 # listening (which it can only do if the bot started successfully).
+# BOT webhook service — moved to external :8443 so the MCP server can own 443.
+# Telegram permits webhooks on 443/80/88/8443, so :8443 is valid. After this
+# change you MUST set the webhook URL to include the port:
+#   fly secrets set TELEGRAM_WEBHOOK_URL=https://rosey.fly.dev:8443 -a rosey
+# WhatsApp via Baileys is outbound (no webhook) so it's unaffected. NOTE: Meta
+# WhatsApp Cloud API webhooks and Alexa skill endpoints REQUIRE 443 — if you
+# depend on those, this swap won't work and we need path-routing instead.
 [[services]]
   protocol = 'tcp'
   internal_port = 8080
@@ -32,15 +39,8 @@ primary_region = 'sjc'
   auto_start_machines = true
   min_machines_running = 1
 
-  # External 80 → redirect to HTTPS; 443 → terminate TLS, forward plain
-  # HTTP to internal_port 8080.
   [[services.ports]]
-    port = 80
-    handlers = ['http']
-    force_https = true
-
-  [[services.ports]]
-    port = 443
+    port = 8443
     handlers = ['tls', 'http']
 
   [[services.tcp_checks]]
@@ -48,12 +48,12 @@ primary_region = 'sjc'
     timeout = '5s'
     grace_period = '20s'
 
-# MCP endpoint (shared household memory) — the co-located mcp_server.py on
-# internal :8089, exposed externally on :8443. The voice PWA and other MCP
-# clients connect here; because it's the SAME container/volume as the engine,
-# all channels share one memory. External 8443 → TLS-terminated → :8089.
+# MCP endpoint (shared household memory) — co-located mcp_server.py on internal
+# :8089, now exposed on standard 443 because OpenAI's realtime backend only
+# connects to MCP servers on 443 (it silently refused the old :8443). Same
+# container/volume as the engine, so all channels share one memory.
 #
-# SECURITY: this serves real household memory and is currently unauthenticated
+# SECURITY: serves real household memory, currently unauthenticated
 # (see mcp_server.py). Demo posture only until per-session auth is added.
 [[services]]
   protocol = 'tcp'
@@ -63,7 +63,12 @@ primary_region = 'sjc'
   min_machines_running = 1
 
   [[services.ports]]
-    port = 8443
+    port = 80
+    handlers = ['http']
+    force_https = true
+
+  [[services.ports]]
+    port = 443
     handlers = ['tls', 'http']
 
   [[services.tcp_checks]]

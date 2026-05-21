@@ -50,9 +50,10 @@ const CONFIG = {
   // must match server.py. Keep the surface narrow.
   MCP_SERVER_LABEL: "rosey",
   // Co-located MCP endpoint on the rosey engine app (shared household memory:
-  // same /data/memories the WhatsApp/Telegram bot uses). External :8443 -> :8089.
+  // same /data/memories the WhatsApp/Telegram bot uses). On standard 443 because
+  // OpenAI's realtime backend only connects to MCP servers on 443.
   // (The standalone rosey-mcp.fly.dev/mcp is the isolated-memory variant.)
-  MCP_SERVER_URL: "https://rosey.fly.dev:8443/mcp",
+  MCP_SERVER_URL: "https://rosey.fly.dev/mcp",
   MCP_ALLOWED_TOOLS: [
     "get_household", "remember",
     "list_grocery_items", "add_grocery_item",
