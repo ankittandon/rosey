@@ -75,6 +75,9 @@ async def _startup():
     # Persistent reminder scheduler (DateTrigger jobs in SQLite jobstore).
     reminder_scheduler.start()
     reminder_scheduler.reconcile()
+    # Pick up reminders written out-of-band by the co-located voice MCP server
+    # (a separate process that can't trigger the per-turn reconcile).
+    reminder_scheduler.schedule_periodic_reconcile()
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", _on_start))

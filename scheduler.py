@@ -74,6 +74,7 @@ from reminder_format import (
     MISS_RE,
     REPEAT_RE,
     URG_RE,
+    _strip_to_user_message,
 )
 
 log = logging.getLogger("rosey.scheduler")
@@ -160,27 +161,11 @@ def _parse_duration(value: str, unit: str) -> timedelta:
     raise ValueError(f"unknown duration unit: {unit!r}")
 
 
-def _strip_to_user_message(message: str) -> str:
-    """Remove all metadata tags + parenthetical annotations to get the
-    plain message body suitable for sending in a reminder of any channel.
-
-    Every tag the agent or reconciler writes onto a line needs to be
-    listed here, or it leaks into the user-facing text. The full set
-    today: @mentions, from:, id:, esc:, miss:, urg:, fb:, plus any
-    (parenthetical) lifecycle annotation.
-    """
-    s = message
-    s = MENTION_RE.sub("", s)
-    s = FROM_RE.sub("", s)
-    s = ID_RE.sub("", s)
-    s = ESC_RE.sub("", s)
-    s = MISS_RE.sub("", s)
-    s = URG_RE.sub("", s)
-    s = FB_RE.sub("", s)
-    s = REPEAT_RE.sub("", s)
-    # Strip parenthetical lifecycle annotations: (fired ...), (acked ...) etc.
-    s = re.sub(r"\([^)]*\)", "", s)
-    return " ".join(s.split())
+# `_strip_to_user_message` now lives in reminder_format (alongside the tag
+# regexes it depends on) so every reader of reminders.md — this scheduler and
+# the co-located MCP server — strips the identical tag set. It's imported above
+# and remains accessible as `scheduler._strip_to_user_message` for callers and
+# tests that reference it by that path.
 
 
 def _format_assignee_html(assignees) -> str:
@@ -342,6 +327,40 @@ def shutdown(wait: bool = False) -> None:
         except Exception:
             log.exception("scheduler shutdown failed")
         _scheduler = None
+
+
+def schedule_periodic_reconcile(interval_seconds: int | None = None) -> None:
+    """Register a recurring reconcile so reminders written OUT-OF-BAND become
+    live scheduler jobs without waiting for an agent turn or a process restart.
+
+    The co-located MCP/voice server (mcp_server.py) writes reminders.md from a
+    SEPARATE process, so it can't trigger the per-turn reconcile in agent.py
+    (which only fires when the agent itself touched the file during a turn).
+    Running reconcile on a timer here — in the engine process that owns the
+    scheduler — closes that gap so a reminder added by voice fires on schedule.
+    reconcile() is idempotent (content-derived ids + replace_existing), so a
+    periodic pass only adds genuinely-new lines and prunes orphans.
+
+    Engine-only: call this from server.py startup, NOT from start(), so unit
+    tests that drive start()/reconcile() directly keep a deterministic job set.
+    Set RECONCILE_INTERVAL_SECONDS=0 to disable.
+    """
+    if interval_seconds is None:
+        interval_seconds = int(os.environ.get("RECONCILE_INTERVAL_SECONDS", "60"))
+    if interval_seconds <= 0:
+        log.info("periodic reconcile disabled (interval=%s)", interval_seconds)
+        return
+    sched = start()
+    sched.add_job(
+        reconcile,
+        trigger="interval",
+        seconds=interval_seconds,
+        id="reconcile:periodic",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+    log.info("periodic reconcile registered — every %ds", interval_seconds)
 
 
 # ---------------------------------------------------------------------------

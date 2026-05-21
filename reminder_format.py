@@ -118,3 +118,30 @@ FIRED_AT_RE = re.compile(r"\(fired at ")
 # Capture the (chat:C msg:M) pair from a fired-annotation, used for
 # reply-to-bot ack lookup.
 FIRED_CHAT_MSG_RE = re.compile(r"chat:(tg:-?\d+)\s+msg:(\d+)")
+
+
+def _strip_to_user_message(message: str) -> str:
+    """Remove all metadata tags + parenthetical annotations to get the
+    plain message body suitable for showing to a user on any channel.
+
+    Lives here, alongside the regexes it depends on, so every consumer
+    (the scheduler that fires reminders, and the MCP server that reads
+    them back over voice) strips the SAME set of tags from the SAME
+    source of truth — a new tag added above can't leak through one
+    reader but not another.
+
+    The full set stripped today: @mentions, from:, id:, esc:, miss:,
+    urg:, fb:, repeat:, plus any (parenthetical) lifecycle annotation.
+    """
+    s = message
+    s = MENTION_RE.sub("", s)
+    s = FROM_RE.sub("", s)
+    s = ID_RE.sub("", s)
+    s = ESC_RE.sub("", s)
+    s = MISS_RE.sub("", s)
+    s = URG_RE.sub("", s)
+    s = FB_RE.sub("", s)
+    s = REPEAT_RE.sub("", s)
+    # Strip parenthetical lifecycle annotations: (fired ...), (acked ...) etc.
+    s = re.sub(r"\([^)]*\)", "", s)
+    return " ".join(s.split())
