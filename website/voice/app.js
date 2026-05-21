@@ -69,7 +69,7 @@ const CONFIG = {
   ],
 
   // Lifecycle timings
-  FOLLOWUP_WINDOW_MS: 4000,   // after Rosey replies, keep listening this long for a follow-up
+  FOLLOWUP_WINDOW_MS: 8000,   // after Rosey replies, keep listening this long for a follow-up
   HARD_TIMEOUT_MS: 90000,     // absolute cap on a single wake session (cost insurance)
   VAD_SILENCE_MS: 1500,       // server VAD: silence that ends a user turn
 
@@ -78,9 +78,8 @@ const CONFIG = {
     "Always use your tools to actually fetch or change things before replying — " +
     "if asked what's on the grocery list, CALL list_grocery_items and read back the " +
     "real result; never say you'll 'check' or 'look into it' without calling the tool. " +
-    "Keep replies short and spoken-friendly. " +
-    "Only call end_conversation after you've fully answered AND the user signals " +
-    "they're done (thanks/bye). Never end in the same reply where you said you'd look something up.",
+    "Keep replies short and spoken-friendly. Finish your sentences fully; the user " +
+    "can ask a follow-up after you're done.",
 };
 
 // ---------------------------------------------------------------------
@@ -258,7 +257,12 @@ async function openSession() {
     if (!ephemeralKey) throw new Error("no ephemeral key in /session response");
 
     // 2) Capture mic and set up the peer connection.
-    const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // Echo cancellation is critical: without it, on a device with speaker+mic
+    // Rosey hears her own voice, server VAD treats it as you interrupting, and
+    // cuts her off mid-sentence. (Headphones also eliminate this entirely.)
+    const mic = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
     pc = new RTCPeerConnection();
     pc.addTrack(mic.getAudioTracks()[0], mic);
 
@@ -301,14 +305,9 @@ function mcpConfigured() {
 }
 
 function configureSession() {
-  const tools = [
-    {
-      type: "function",
-      name: "end_conversation",
-      description: "End the conversation and go back to sleep when the user is done.",
-      parameters: { type: "object", properties: {}, required: [] },
-    },
-  ];
+  // No end_conversation tool: it was firing mid-reply and cutting Rosey off.
+  // Sessions end naturally on the silence follow-up window (or hard timeout).
+  const tools = [];
 
   if (mcpConfigured()) {
     const requireApproval =
@@ -335,7 +334,13 @@ function configureSession() {
       // (confirmed by the /session response shape), not at the top of session.
       audio: {
         input: {
-          turn_detection: { type: "server_vad", silence_duration_ms: CONFIG.VAD_SILENCE_MS },
+          // interrupt_response:false — don't let detected speech (including echo of
+      // Rosey's own voice on speaker+mic setups) cut off her reply mid-sentence.
+      turn_detection: {
+        type: "server_vad",
+        silence_duration_ms: CONFIG.VAD_SILENCE_MS,
+        interrupt_response: false,
+      },
         },
       },
       tools,
@@ -369,11 +374,6 @@ function handleEvent(evt) {
     case "response.done":
       setState(STATE.LISTENING, "Anything else?");
       armFollowupWindow();
-      break;
-
-    // Local function tool: explicit goodbye.
-    case "response.function_call_arguments.done":
-      if (evt.name === "end_conversation") endSession("goodbye-tool");
       break;
 
     // --- MCP lifecycle logging (so tool problems are visible, not silent) ---
