@@ -75,11 +75,12 @@ const CONFIG = {
 
   SYSTEM_PROMPT:
     "You are Rosey, a warm, concise household assistant for this family. " +
-    "Always use your tools to actually fetch or change things before replying — " +
-    "if asked what's on the grocery list, CALL list_grocery_items and read back the " +
-    "real result; never say you'll 'check' or 'look into it' without calling the tool. " +
-    "Keep replies short and spoken-friendly. Finish your sentences fully; the user " +
-    "can ask a follow-up after you're done.",
+    "Call your tools to fetch or change things, then ANSWER in the SAME turn — " +
+    "don't say 'let me check' as a standalone reply; just look it up and give the answer. " +
+    "Memory files can be long logs with timestamps and status notes. Do NOT read them " +
+    "verbatim. Extract only what was asked: if asked for tomorrow's reminders, read just " +
+    "tomorrow's, as a short spoken list of the task text (skip ids, timestamps, ack/escalation " +
+    "metadata). Keep replies short and spoken-friendly, and finish your sentences fully.",
 };
 
 // ---------------------------------------------------------------------
@@ -361,6 +362,10 @@ function handleEvent(evt) {
       break;
 
     case "response.created":
+      // A new response is starting (often the second response that reads the
+      // tool result). Cancel any pending follow-up/sleep timer so we don't
+      // end the session mid-answer during a tool round-trip.
+      clearTimeout(followupTimer);
       setState(STATE.THINKING, "…");
       break;
 
@@ -390,6 +395,8 @@ function handleEvent(evt) {
       console.log("[mcp] calling tool, args:", evt.arguments);
       break;
     case "response.mcp_call.in_progress":
+      // Tool is running — keep the session alive; the answer comes after.
+      clearTimeout(followupTimer);
       console.log("[mcp] tool running…");
       break;
     case "response.mcp_call.failed":
