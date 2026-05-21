@@ -206,12 +206,39 @@ async function openSession() {
 }
 
 // Configure the session once the data channel is open: instructions, VAD,
-// and tools (the Rosey MCP server + a local end_conversation function tool).
+// and tools. The Rosey MCP server is attached ONLY when MCP_SERVER_URL is set
+// to a real URL — so you can test the talk->sleep loop first, then wire MCP
+// later without touching this file's structure.
+function mcpConfigured() {
+  const u = CONFIG.MCP_SERVER_URL || "";
+  return u.startsWith("http") && !u.includes("YOUR_ROSEY_MCP_SERVER_URL");
+}
+
 function configureSession() {
-  const requireApproval =
-    CONFIG.MCP_AUTO_RUN_TOOLS.length === CONFIG.MCP_ALLOWED_TOOLS.length
-      ? "never"
-      : { never: { tool_names: CONFIG.MCP_AUTO_RUN_TOOLS } };
+  const tools = [
+    {
+      type: "function",
+      name: "end_conversation",
+      description: "End the conversation and go back to sleep when the user is done.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  ];
+
+  if (mcpConfigured()) {
+    const requireApproval =
+      CONFIG.MCP_AUTO_RUN_TOOLS.length === CONFIG.MCP_ALLOWED_TOOLS.length
+        ? "never"
+        : { never: { tool_names: CONFIG.MCP_AUTO_RUN_TOOLS } };
+    tools.unshift({
+      type: "mcp",
+      server_label: CONFIG.MCP_SERVER_LABEL,
+      server_url: CONFIG.MCP_SERVER_URL,
+      allowed_tools: CONFIG.MCP_ALLOWED_TOOLS,
+      require_approval: requireApproval,
+    });
+  } else {
+    console.warn("MCP_SERVER_URL not set — running without Rosey tools (talk-only).");
+  }
 
   send({
     type: "session.update",
@@ -219,21 +246,7 @@ function configureSession() {
       type: "realtime",
       instructions: CONFIG.SYSTEM_PROMPT,
       turn_detection: { type: "server_vad", silence_duration_ms: CONFIG.VAD_SILENCE_MS },
-      tools: [
-        {
-          type: "mcp",
-          server_label: CONFIG.MCP_SERVER_LABEL,
-          server_url: CONFIG.MCP_SERVER_URL,
-          allowed_tools: CONFIG.MCP_ALLOWED_TOOLS,
-          require_approval: requireApproval,
-        },
-        {
-          type: "function",
-          name: "end_conversation",
-          description: "End the conversation and go back to sleep when the user is done.",
-          parameters: { type: "object", properties: {}, required: [] },
-        },
-      ],
+      tools,
     },
   });
 }
