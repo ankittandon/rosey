@@ -1,0 +1,6 @@
+Drop two files here from the Picovoice console (https://console.picovoice.ai, free):
+
+  1. Rosey.ppn              -> custom "Rosey" wake-word file (pick Web/WASM platform)
+  2. porcupine_params.pv    -> the base Porcupine model params
+
+Paths are referenced in app.js -> CONFIG.PORCUPINE_KEYWORD_PATH / PORCUPINE_MODEL_PATH.

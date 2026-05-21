@@ -1,0 +1,7 @@
+Drop two PNG app icons here (used by manifest.webmanifest):
+
+  1. rosey-192.png   (192x192)
+  2. rosey-512.png   (512x512)
+
+Easiest: resize the existing website/rosey-logo.png to these sizes on a dark
+(#1b1b1f) background so the maskable icon looks right on the home screen.

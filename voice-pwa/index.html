@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#1b1b1f" />
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="./icons/rosey-192.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>Rosey</title>
+  <style>
+    :root {
+      --bg: #1b1b1f;
+      --fg: #f5f3ee;
+      --muted: #9a978f;
+      --asleep: #4a4a52;
+      --listening: #4cc38a;
+      --thinking: #e0a44a;
+      --error: #e2585b;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body {
+      margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      overflow: hidden; user-select: none;
+    }
+    #app {
+      height: 100dvh; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 2rem; padding: 1.5rem;
+    }
+    #orb {
+      width: 180px; height: 180px; border-radius: 50%;
+      background: radial-gradient(circle at 35% 30%, #6b6b76, var(--asleep));
+      box-shadow: 0 0 0 0 rgba(76,195,138,0);
+      transition: background 0.4s ease, box-shadow 0.4s ease, transform 0.2s ease;
+      display: flex; align-items: center; justify-content: center;
+    }
+    #orb .daisy { font-size: 4rem; opacity: 0.85; }
+    body[data-state="listening"] #orb {
+      background: radial-gradient(circle at 35% 30%, #7fe3b3, var(--listening));
+      box-shadow: 0 0 60px 8px rgba(76,195,138,0.45);
+      animation: pulse 1.6s ease-in-out infinite;
+    }
+    body[data-state="thinking"] #orb {
+      background: radial-gradient(circle at 35% 30%, #f0c478, var(--thinking));
+      box-shadow: 0 0 50px 6px rgba(224,164,74,0.4);
+    }
+    body[data-state="error"] #orb {
+      background: radial-gradient(circle at 35% 30%, #f08d8f, var(--error));
+    }
+    @keyframes pulse {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.06); }
+    }
+    #status { font-size: 1.05rem; color: var(--muted); text-align: center; min-height: 1.4em; }
+    #transcript {
+      font-size: 0.95rem; color: var(--fg); opacity: 0.8; text-align: center;
+      max-width: 32ch; min-height: 2.6em; line-height: 1.3;
+    }
+    #start {
+      padding: 0.9rem 1.8rem; border: none; border-radius: 999px;
+      background: var(--fg); color: var(--bg); font-size: 1rem; font-weight: 600;
+    }
+    #start[hidden] { display: none; }
+    #wakeword { font-size: 0.8rem; color: var(--muted); opacity: 0.6; }
+    code { background: rgba(255,255,255,0.08); padding: 0.1em 0.35em; border-radius: 4px; }
+  </style>
+</head>
+<body data-state="boot">
+  <div id="app">
+    <div id="orb"><span class="daisy">&#127802;</span></div>
+    <div id="status">Tap to start Rosey</div>
+    <div id="transcript"></div>
+    <button id="start">Start Rosey</button>
+    <div id="wakeword">Then say &ldquo;<strong>Rosey</strong>&rdquo; to wake me</div>
+  </div>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
