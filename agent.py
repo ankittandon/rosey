@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover
 from anthropic import Anthropic
 
 import feed_format
+import reminder_builder
 from memory_tool import FileMemoryTool, RedactingMemoryTool
 from redact import Redactor, enabled as redaction_enabled
 from reminder_format import FORMAT_DOC as REMINDER_FORMAT
@@ -253,14 +254,28 @@ reminder fire, do TWO things in sequence:
 
 Reminders: when someone asks you to remind them about something at a
 specific time ("remind me Friday at 9am to take out the trash", "nudge
-Sam tomorrow morning to call the dentist"), append a line to
-/memories/reminders.md in this EXACT format and nothing else:
+Sam tomorrow morning to call the dentist", "remind Sunanda 5 times a day
+between 9 and 5"), ALWAYS use the `create_reminders` tool. Do NOT hand-write
+reminder lines into reminders.md, and NEVER invent section headers like
+"## Pending" — the tool formats every line correctly, picks the right
+first-occurrence date for each time (today if still ahead, else tomorrow),
+expands "N times a day" into N entries, and tells you the exact times it
+scheduled. Confirm those returned times to the user; don't guess.
+  - Pass `recipients` for who's responsible (e.g. ["Sunanda"]); they're tagged
+    in the message. Reminders created in a group chat are delivered to the
+    whole group automatically.
+  - Pass `repeat` ("daily", "weekly", "2h", …) for recurring reminders.
+
+The memory tool is still how you READ reminders.md and how you ACK or EDIT an
+existing line (appending "(acked by …)", changing a time). For reference, the
+canonical line format the file uses is:
 
   {reminder_format}
 
 Use 24-hour time. Times are in the household's local timezone — assume
-that automatically; don't include a timezone suffix. The timestamp MUST
-be strictly in the future (see the CRITICAL date rule above).
+that automatically; don't include a timezone suffix. Any timestamp MUST
+be strictly in the future (see the CRITICAL date rule above); the
+create_reminders tool guarantees this for you.
 
 How to actually add the line to the file — the file structure is:
 
@@ -937,6 +952,52 @@ def handle_message(
                         "type": "tool_result",
                         "tool_use_id": tu.id,
                         "content": _memory_error_hint(f"Error: {e}"),
+                        "is_error": True,
+                    })
+            elif tu.name == "create_reminders":
+                # Deterministic creation: the model picked the text + times; the
+                # builder does the date math + formatting and writes the lines.
+                # The mtime check after the loop triggers reconcile, turning the
+                # new lines into live scheduler jobs.
+                try:
+                    inp = tu.input or {}
+                    if ZoneInfo is not None:
+                        try:
+                            now_dt = datetime.now(ZoneInfo(tz_name))
+                        except Exception:
+                            now_dt = datetime.now()
+                    else:
+                        now_dt = datetime.now()
+                    lines, occ = reminder_builder.build_occurrences(
+                        inp.get("text", ""),
+                        inp.get("times") or [],
+                        now=now_dt,
+                        repeat=inp.get("repeat"),
+                        recipients=inp.get("recipients") or [],
+                        origin_chat=origin_chat,
+                        urgency=inp.get("urgency", "normal"),
+                    )
+                    reminder_builder.write_lines_to_head(reminders_path, lines)
+                    body = " ".join((inp.get("text", "")).split())
+                    summary = reminder_builder.summarize(occ, now_dt, inp.get("repeat"))
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tu.id,
+                        "content": f'Scheduled "{body}": {summary}.',
+                    })
+                except reminder_builder.ReminderError as e:
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tu.id,
+                        "content": str(e),
+                        "is_error": True,
+                    })
+                except Exception as e:
+                    log.warning("turn=%s create_reminders error: %s", turn_id, e)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tu.id,
+                        "content": f"Error creating reminders: {e}",
                         "is_error": True,
                     })
             else:

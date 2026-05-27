@@ -28,9 +28,9 @@ RUN cd baileys && npm install --omit=dev --no-audit --no-fund
 # Python sources. Update this list when adding modules. Avoids COPY *
 # which would also copy .env, .venv, scheduler.db, etc.
 COPY agent.py alexa_handler.py app.py channels.py feed_format.py gate.py household.py \
-     mcp_server.py memory_tool.py paths.py redact.py reminder_format.py reminders.py roster.py \
-     scheduler.py server.py summary.py telegram_bot.py tools.py transcribe.py \
-     whatsapp_handler.py ./
+     mcp_server.py memory_tool.py paths.py redact.py reminder_builder.py reminder_format.py \
+     reminders.py roster.py scheduler.py server.py summary.py telegram_bot.py tools.py \
+     transcribe.py whatsapp_handler.py ./
 
 # Baileys source + the wrapper that launches both processes.
 COPY baileys/index.js ./baileys/

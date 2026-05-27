@@ -123,7 +123,7 @@ const bridge = http.createServer(async (req, res) => {
   req.on('data', (chunk) => (body += chunk));
   req.on('end', async () => {
     try {
-      const { to, text } = JSON.parse(body);
+      const { to, text, mentions } = JSON.parse(body);
       if (!to || typeof text !== 'string') {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: "missing 'to' or 'text'" }));
@@ -135,7 +135,14 @@ const bridge = http.createServer(async (req, res) => {
         return;
       }
       const jid = toJid(to);
-      const result = await sock.sendMessage(jid, { text });
+      // Optional `mentions`: array of JIDs to @-ping. The text must contain the
+      // matching `@<user-part>` token(s) for WhatsApp to render the mention.
+      // Backward compatible — when absent, behaves exactly as before.
+      const msgContent = { text };
+      if (Array.isArray(mentions) && mentions.length > 0) {
+        msgContent.mentions = mentions;
+      }
+      const result = await sock.sendMessage(jid, msgContent);
       log.info({ to: jid, msgId: result?.key?.id }, 'outbound sent');
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ id: result?.key?.id, jid }));

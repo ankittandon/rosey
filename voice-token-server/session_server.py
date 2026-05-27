@@ -29,12 +29,18 @@ DEFAULT_MODEL = os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime-2")
 TRANSCRIPTION_MODEL = os.environ.get("OPENAI_REALTIME_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe")
 VAD_SILENCE_MS = int(os.environ.get("OPENAI_REALTIME_VAD_SILENCE_MS", "650"))
 
+# On-device wake-word AccessKey for the PWA's Porcupine engine. Served at
+# runtime via /wake-key so it never lives in the static bundle or git. Set it as
+# a secret:  fly secrets set PICOVOICE_ACCESS_KEY=... -a rosey-voice-token
+PICOVOICE_ACCESS_KEY = os.environ.get("PICOVOICE_ACCESS_KEY", "")
+
 MCP_SERVER_LABEL = os.environ.get("ROSEY_MCP_SERVER_LABEL", "rosey")
 MCP_SERVER_URL = os.environ.get("ROSEY_MCP_SERVER_URL", "https://rosey.fly.dev/mcp")
 MCP_ALLOWED_TOOLS = [
-    "get_household", "remember",
+    "get_household", "remember", "get_current_time",
     "list_grocery_items", "add_grocery_item",
-    "list_reminders", "add_reminder",
+    "list_reminders", "add_reminder", "add_recurring_reminder",
+    "update_reminder", "delete_reminder",
     "log_feed", "amend_last_feed", "list_feeds",
 ]
 MCP_AUTO_RUN_TOOLS = MCP_ALLOWED_TOOLS
@@ -52,6 +58,18 @@ SYSTEM_PROMPT = (
     "too', 'it was 2 oz not 1'), call amend_last_feed instead of logging again. "
     "For ANY question about feeds (when, how much, daily totals) call list_feeds — you "
     "CAN see the feed log through it, so never say you can't. "
+    "For the current time or date ('what time is it', 'what day is it', today's date), "
+    "call get_current_time — you do not have your own clock, so never guess or say you "
+    "can't tell the time. "
+    "To set a reminder that fires several times a day or repeats (e.g. '5 times a day "
+    "between 9 and 5', 'every morning'), call add_recurring_reminder with the list of "
+    "times; for a single one-off time, add_reminder is fine. "
+    "To change an existing reminder (its time, wording, or how often it repeats), call "
+    "update_reminder; to cancel one, call delete_reminder. Identify which one by a few "
+    "words of its text. You CAN edit and stop recurring reminders this way — to stop a "
+    "repeating reminder for good use delete_reminder, or use update_reminder with "
+    "repeat 'none' to let the next one happen but not recur after that. Never say you "
+    "can't change or stop a reminder. "
     "Memory files can be long logs with timestamps and status notes. Do NOT read them "
     "verbatim. Extract only what was asked: if asked for tomorrow's reminders, read just "
     "tomorrow's, as a short spoken list of the task text, skipping ids, timestamps, "
@@ -66,8 +84,25 @@ ALLOWED_ORIGIN = os.environ.get("ROSEY_PWA_ORIGIN", "*")
 def _cors(resp):
     resp.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return resp
+
+
+@app.route("/wake-key", methods=["OPTIONS"])
+def wake_key_preflight():
+    return _cors(make_response("", 204))
+
+
+@app.route("/wake-key", methods=["GET"])
+def wake_key():
+    """Serve the Picovoice wake-word AccessKey to the PWA at runtime.
+
+    Keeps the key out of the static site bundle and git history. Set it with:
+        fly secrets set PICOVOICE_ACCESS_KEY=... -a rosey-voice-token
+    """
+    if not PICOVOICE_ACCESS_KEY:
+        return _cors(jsonify({"error": "PICOVOICE_ACCESS_KEY not set on the server"})), 500
+    return _cors(jsonify({"accessKey": PICOVOICE_ACCESS_KEY}))
 
 
 @app.route("/session", methods=["OPTIONS"])

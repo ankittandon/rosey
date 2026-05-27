@@ -203,6 +203,52 @@ def _format_assignee_html(assignees) -> str:
     return " ".join(parts)
 
 
+# --- WhatsApp group @-mentions ----------------------------------------------
+# A true WhatsApp @-ping needs the message text to contain `@<user-part>` AND a
+# parallel `mentions` array of JIDs. WhatsApp identifies group participants by
+# their LID, so we prefer the household's `wa-lid:` id and fall back to the phone
+# number. Gated behind WHATSAPP_GROUP_MENTIONS because the LID-vs-phone render
+# behavior can only be confirmed against a live group; when off (default), group
+# reminders go out exactly as before (assignee name as plain text).
+_WA_LID_RE = re.compile(r"\bwa-lid:\+?(\w+)")
+_WA_PHONE_RE = re.compile(r"\bwa:\+?(\d+)")
+
+
+def _wa_group_mentions_enabled() -> bool:
+    return os.environ.get("WHATSAPP_GROUP_MENTIONS", "").strip().lower() in (
+        "on", "1", "true", "yes",
+    )
+
+
+def _wa_mention_for(name: str):
+    """Return (text_token, jid) to @-ping `name` in a WhatsApp group, or None.
+
+    Prefers the LID (how WA addresses group members) over the phone number.
+    Reads household.md directly so roster edits take effect without a restart.
+    """
+    if not name:
+        return None
+    try:
+        path = memories_dir() / "household.md"
+        if not path.exists():
+            return None
+        name_re = re.compile(r"\b" + re.escape(name.strip().lower()) + r"\b")
+        for line in path.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if not s.startswith("- ") or not name_re.search(s.lower()):
+                continue
+            lid = _WA_LID_RE.search(s)
+            if lid:
+                return (f"@{lid.group(1)}", f"{lid.group(1)}@lid")
+            ph = _WA_PHONE_RE.search(s)
+            if ph:
+                return (f"@{ph.group(1)}", f"{ph.group(1)}@s.whatsapp.net")
+            return None
+    except Exception:
+        log.exception("_wa_mention_for failed for %r", name)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Fallback resolution — runs at fallback-fire time, not at schedule time,
 # so roster edits between scheduling and firing take effect.
@@ -303,13 +349,18 @@ def start() -> BackgroundScheduler:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         jobstore = SQLAlchemyJobStore(url=f"sqlite:///{db_path}")
 
+        # If the bot was offline when a job was due, fire it within this window
+        # on resume; past it, the job is dropped (not replayed). 24h was too
+        # long — any outage longer than a few minutes replayed a whole day of
+        # stale reminders into the chat on restart. 1h (default) still covers
+        # deploys and brief restarts without dumping yesterday's backlog.
+        # Tune with SCHEDULER_MISFIRE_GRACE_SECONDS.
+        misfire_grace = int(os.environ.get("SCHEDULER_MISFIRE_GRACE_SECONDS", "3600"))
         sched = BackgroundScheduler(
             jobstores={"default": jobstore},
             timezone=_local_tz() or "UTC",
-            # If the bot was offline when a job was due, fire it within
-            # this window on resume. coalesce → only once even if many
-            # ticks were missed.
-            job_defaults={"coalesce": True, "misfire_grace_time": 24 * 60 * 60},
+            # coalesce → collapse many missed ticks of the same job into one fire.
+            job_defaults={"coalesce": True, "misfire_grace_time": misfire_grace},
         )
         sched.start()
         _scheduler = sched
@@ -655,7 +706,27 @@ def fire_one(
 
     sent_pairs: list[tuple[str, int]] = []
     for ident in recipients:
-        msg_id = channels.send_returning_msg_id(ident, body, parse_mode="HTML")
+        send_body = body
+        mentions = None
+        # Real WhatsApp @-ping for group sends (opt-in via WHATSAPP_GROUP_MENTIONS).
+        # Fail-safe: if the flag is off, the target isn't a WA group, or no JID
+        # resolves, we fall straight back to the default body with no mentions.
+        if (_wa_group_mentions_enabled() and ident.startswith("wa:group:")
+                and assignee_names):
+            toks, jids = [], []
+            for entry in assignee_names:
+                nm = entry if isinstance(entry, str) else (entry[0] if entry else "")
+                mm = _wa_mention_for(nm)
+                if mm:
+                    toks.append(mm[0])
+                    jids.append(mm[1])
+            if jids:
+                plain = _strip_to_user_message(raw_message)
+                send_body = f"⏰ Reminder for {' '.join(toks)}: {plain}"
+                mentions = jids
+        msg_id = channels.send_returning_msg_id(
+            ident, send_body, parse_mode="HTML", mentions=mentions,
+        )
         if msg_id is not None:
             sent_pairs.append((ident, msg_id))
 
@@ -1157,6 +1228,20 @@ def _annotate_and_move(task_id: str, annotation: str, target_section: str) -> bo
 # Reconcile: the entry point called on startup and after each agent turn.
 # ---------------------------------------------------------------------------
 
+def _is_group_chat(ident: Optional[str]) -> bool:
+    """True for multi-person chats: WhatsApp groups (``wa:group:…``) and
+    Telegram groups/supergroups (negative chat ids, ``tg:-NNN``). Used to decide
+    whether a reminder created in a group should fire INTO that group rather
+    than DMing the assignee 1:1."""
+    if not ident:
+        return False
+    if ident.startswith("wa:group:"):
+        return True
+    if ident.startswith("tg:"):
+        return ident[len("tg:"):].lstrip().startswith("-")
+    return False
+
+
 def reconcile() -> None:
     """Sync /memories/reminders.md → scheduler jobs.
 
@@ -1362,6 +1447,20 @@ def reconcile() -> None:
                 intervals["miss"] = _parse_duration(*miss_match.groups())
             except ValueError:
                 pass
+
+        # Household default: a reminder created in a group chat fires INTO that
+        # group, with the assignee tagged inside the message, rather than DMing
+        # people 1:1 — so the whole household has visibility. The resolved
+        # @-mentions stay in `assignees`, so fire_one/escalate_one still tag the
+        # responsible person in the group message. Misses already notify the
+        # group (miss_one → origin_chat) and acks broadcast back to it, so this
+        # makes the primary fire + escalation consistent with the rest of the
+        # ladder. The private "fallback to a different person" tier is dropped
+        # here: once everyone sees the group post, a 1:1 nudge to someone else
+        # is just noise.
+        if _is_group_chat(origin_chat):
+            addressee_chains = [("group", [origin_chat])]
+            intervals["fallback"] = None
 
         desired_jobs[p["task_id"]] = {
             "ts_str": p["ts_str"],

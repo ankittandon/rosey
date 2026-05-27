@@ -48,20 +48,27 @@ WHATSAPP_TEXT_LIMIT = 4096
 WHATSAPP_API_BASE = "https://graph.facebook.com/v25.0"
 
 
-def send(identifier: str, body: str, parse_mode: str | None = None) -> bool:
+def send(identifier: str, body: str, parse_mode: str | None = None,
+         mentions: list[str] | None = None) -> bool:
     """Dispatch outbound message by identifier prefix.
 
     Returns True on success, False if creds are missing or the API
     call failed. Errors are logged, not raised — fan-out callers should
     keep going for the other recipients.
     """
-    return send_returning_msg_id(identifier, body, parse_mode=parse_mode) is not None
+    return send_returning_msg_id(
+        identifier, body, parse_mode=parse_mode, mentions=mentions,
+    ) is not None
 
 
 def send_returning_msg_id(
     identifier: str, body: str, parse_mode: str | None = None,
+    mentions: list[str] | None = None,
 ) -> int | str | None:
     """Like send() but returns the platform message_id on success.
+
+    `mentions` (WhatsApp only): a list of JIDs to @-ping; the body must contain
+    the matching `@<user-part>` token(s). Ignored for Telegram.
 
     Return type varies by channel:
       - Telegram: int (Telegram's numeric `message.message_id`)
@@ -81,8 +88,8 @@ def send_returning_msg_id(
         # `group:<jid>` form intact and Baileys's toJid() handles it.
         rest = identifier[len("wa:"):]
         if rest.startswith("group:"):
-            return send_whatsapp(rest, body)  # pass through to Baileys
-        return send_whatsapp(rest.lstrip("+"), body)
+            return send_whatsapp(rest, body, mentions=mentions)  # pass through
+        return send_whatsapp(rest.lstrip("+"), body, mentions=mentions)
     log.warning("unknown identifier scheme: %s", identifier)
     return None
 
@@ -137,11 +144,15 @@ def send_telegram(
         return None
 
 
-def send_whatsapp(phone: str, body: str) -> str | None:
+def send_whatsapp(phone: str, body: str,
+                  mentions: list[str] | None = None) -> str | None:
     """Route a WhatsApp send to either Baileys (if BAILEYS_MODE is on)
     or Meta's Cloud API (default). Returns the message id on success,
     None on failure. Caller doesn't need to know which transport; the
     semantics are the same from the outside.
+
+    `mentions` (Baileys only): JIDs to @-ping; the body must contain the
+    matching `@<user-part>` token(s). Ignored by the Cloud API path.
 
     `phone` for Cloud API is E.164 *without* leading `+`. For Baileys
     it can be either a phone number (we normalize) or a full JID
@@ -155,7 +166,7 @@ def send_whatsapp(phone: str, body: str) -> str | None:
     """
     plain_body = html.unescape(_HTML_TAG_RE.sub("", body))
     if _baileys_mode_enabled():
-        return _send_via_baileys(phone, plain_body)
+        return _send_via_baileys(phone, plain_body, mentions=mentions)
     return _send_via_cloud_api(phone, plain_body)
 
 
@@ -164,7 +175,8 @@ def _baileys_mode_enabled() -> bool:
     return val in ("on", "1", "true", "yes")
 
 
-def _send_via_baileys(target: str, body: str) -> str | None:
+def _send_via_baileys(target: str, body: str,
+                      mentions: list[str] | None = None) -> str | None:
     """POST to the local Baileys sidecar's /send endpoint. The Node
     process forwards via Baileys, returns the WhatsApp message id.
 
@@ -180,10 +192,13 @@ def _send_via_baileys(target: str, body: str) -> str | None:
         )
         return None
     url = f"http://127.0.0.1:{bridge_port}/send"
-    payload = json.dumps({
+    payload_obj = {
         "to": target,
         "text": body[:WHATSAPP_TEXT_LIMIT],
-    }).encode("utf-8")
+    }
+    if mentions:
+        payload_obj["mentions"] = mentions
+    payload = json.dumps(payload_obj).encode("utf-8")
     req = urllib.request.Request(
         url, data=payload, headers={
             "Content-Type": "application/json",

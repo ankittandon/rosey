@@ -28,9 +28,11 @@
 
 const CONFIG = {
   // "tap" | "webspeech" | "porcupine"
-  WAKE_ENGINE: "tap",
+  WAKE_ENGINE: "porcupine",
 
   WAKE_WORD_LABEL: "Rosey",
+  // Leave as the placeholder to fetch the key from WAKE_KEY_ENDPOINT at runtime
+  // (recommended). Only set a literal key here for quick local testing.
   PICOVOICE_ACCESS_KEY: "<YOUR_PICOVOICE_ACCESS_KEY>",
   PORCUPINE_KEYWORD_PATH: "./models/Rosey.ppn",     // custom keyword from Picovoice console
   PORCUPINE_MODEL_PATH: "./models/porcupine_params.pv",
@@ -41,6 +43,11 @@ const CONFIG = {
   // absolute cross-origin URL (the server sends CORS headers for rosey.family).
   // Update the app name here if you name the Fly app something else.
   SESSION_ENDPOINT: "https://rosey-voice-token.fly.dev/session",
+
+  // Picovoice wake-word AccessKey is fetched at runtime from the token server
+  // (set there as a Fly secret) so it never ships in this static bundle or git.
+  // Same host as SESSION_ENDPOINT.
+  WAKE_KEY_ENDPOINT: "https://rosey-voice-token.fly.dev/wake-key",
 
   REALTIME_MODEL: "gpt-realtime-2",
   // OpenAI WebRTC SDP exchange endpoint for voice-agent sessions.
@@ -56,28 +63,36 @@ const CONFIG = {
   // (The standalone rosey-mcp.fly.dev/mcp is the isolated-memory variant.)
   MCP_SERVER_URL: "https://rosey.fly.dev/mcp",
   MCP_ALLOWED_TOOLS: [
-    "get_household", "remember",
+    "get_household", "remember", "get_current_time",
     "list_grocery_items", "add_grocery_item",
-    "list_reminders", "add_reminder",
+    "list_reminders", "add_reminder", "add_recurring_reminder",
+    "update_reminder", "delete_reminder",
     "log_feed", "amend_last_feed", "list_feeds",
   ],
   // All of these are low-risk household actions, so auto-run them (no approval
   // prompt) for a smooth hands-free experience. When you add genuinely sensitive
   // tools later (e.g. send_message), leave them OUT of AUTO_RUN so they gate.
   MCP_AUTO_RUN_TOOLS: [
-    "get_household", "remember",
+    "get_household", "remember", "get_current_time",
     "list_grocery_items", "add_grocery_item",
-    "list_reminders", "add_reminder",
+    "list_reminders", "add_reminder", "add_recurring_reminder",
+    "update_reminder", "delete_reminder",
     "log_feed", "amend_last_feed", "list_feeds",
   ],
 
   // Lifecycle timings
   FOLLOWUP_WINDOW_MS: 8000,   // after Rosey replies, keep listening this long for a follow-up
-  HARD_TIMEOUT_MS: 90000,     // absolute cap on a single wake session (cost insurance)
+  HARD_TIMEOUT_MS: 90000,     // close after this long with NO completed turn (re-armed each turn) — cost insurance, not a conversation cap
   READY_TIMEOUT_MS: 5000,     // don't stay muted forever if tool setup fails
   VAD_SILENCE_MS: 650,        // fallback only; token server owns the real value
   WAKE_TRANSCRIPT_RE: /\b(rosey|rosie|rozey|rosy)\b/i,
   WAKE_WORD_ONLY_RE: /\b(rosey|rosie|rozey|rosy)\b/gi,
+  // Spoken "closing" phrase to dismiss Rosey immediately and return to on-device
+  // sleep, e.g. "Rosey stop", "stop Rosey", "Rosey go to sleep", "goodbye Rosey".
+  // This is just the closer keywords; maybeStopWord() additionally requires the
+  // wake word AND that nothing else of substance was said, so a normal sentence
+  // that merely contains "stop" (e.g. "remind me to stop by") can't dismiss it.
+  STOP_WORDS_RE: /\b(stop|sleep|go to sleep|goodbye|good ?night|bye|dismiss|that'?s all|i'?m done|we'?re done)\b/i,
 
   SYSTEM_PROMPT:
     "You are Rosey, a warm, concise household assistant for this family. " +
@@ -91,6 +106,18 @@ const CONFIG = {
     "just logged (e.g. 'there was poop too'), call amend_last_feed, don't log again. " +
     "For ANY question about feeds (when, how much, daily totals) call list_feeds — you " +
     "CAN see the feed log through it, so never say you can't. " +
+    "For the current time or date ('what time is it', 'what day is it', today's date), " +
+    "call get_current_time — you do not have your own clock, so never guess or say you " +
+    "can't tell the time. " +
+    "To set a reminder that fires several times a day or repeats (e.g. '5 times a day " +
+    "between 9 and 5', 'every morning'), call add_recurring_reminder with the list of " +
+    "times; for a single one-off time, add_reminder is fine. " +
+    "To change an existing reminder (its time, wording, or how often it repeats), call " +
+    "update_reminder; to cancel one, call delete_reminder. Identify which one by a few " +
+    "words of its text. You CAN edit and stop recurring reminders this way — to stop a " +
+    "repeating reminder for good use delete_reminder, or use update_reminder with repeat " +
+    "'none' to let the next one happen but not recur after that. Never say you can't " +
+    "change or stop a reminder. " +
     "Memory files can be long logs with timestamps and status notes. Do NOT read them " +
     "verbatim. Extract only what was asked: if asked for tomorrow's reminders, read just " +
     "tomorrow's, as a short spoken list of the task text (skip ids, timestamps, ack/escalation " +
@@ -119,6 +146,10 @@ let responseActive = false;
 let responsePending = false;   // response.create sent, response.created not yet seen
 let wakeInterruptSent = false;
 let pendingResponseAfterCancel = false;
+let stopRequested = false;     // a spoken "Rosey stop" closer is tearing the session down
+let toolCallThisResponse = false;       // current response invoked an MCP tool (for logging)
+let pendingToolResult = false;          // tool finished mid-turn; speak result on response.done
+let toolResultChainCount = 0;           // guard against runaway tool->response loops
 let inputTranscripts = new Map();
 let respondedInputItems = new Set();
 
@@ -230,19 +261,46 @@ function stopWebSpeech() {
 
 // --- porcupine engine: on-device keyword (needs Picovoice approval) ---
 async function startPorcupine() {
-  const [{ PorcupineWorker }, { WebVoiceProcessor }] = await Promise.all([
-    import("https://cdn.jsdelivr.net/npm/@picovoice/porcupine-web@3.0.3/dist/iife/index.js"),
-    import("https://cdn.jsdelivr.net/npm/@picovoice/web-voice-processor@4.0.9/dist/iife/index.js"),
-  ]);
-  wvp = WebVoiceProcessor;
-  porcupine = await PorcupineWorker.create(
-    CONFIG.PICOVOICE_ACCESS_KEY,
-    { label: CONFIG.WAKE_WORD_LABEL, publicPath: CONFIG.PORCUPINE_KEYWORD_PATH },
-    onWake,
-    { publicPath: CONFIG.PORCUPINE_MODEL_PATH }
-  );
-  await wvp.subscribe(porcupine);
-  setState(STATE.ASLEEP, 'Say "Rosey" to wake me');
+  try {
+    // Get the AccessKey. Prefer a runtime fetch from the token server so the key
+    // stays out of this static bundle / git; only use a literal CONFIG key if one
+    // was set (i.e. it isn't the "<...>" placeholder).
+    let accessKey = CONFIG.PICOVOICE_ACCESS_KEY;
+    if (!accessKey || accessKey.startsWith("<")) {
+      const r = await fetch(CONFIG.WAKE_KEY_ENDPOINT, { method: "GET" });
+      if (!r.ok) throw new Error(`wake-key endpoint returned ${r.status}`);
+      accessKey = (await r.json()).accessKey;
+    }
+    if (!accessKey) throw new Error("no Picovoice AccessKey available");
+
+    // Use the ESM builds (dist/esm), NOT iife: a dynamic import() of the iife
+    // bundle attaches symbols to a global and exposes no ES named exports, so
+    // `{ PorcupineWorker }` would be undefined. The esm builds export the
+    // symbols and are self-contained (no bare deps), so they load straight from
+    // the CDN. porcupine-web@4.0.0 matches the v4 model files in ./models
+    // (porcupine_params.pv reports engine version porcupine4.0.0); a v3 SDK
+    // would reject them at init.
+    const [{ PorcupineWorker }, { WebVoiceProcessor }] = await Promise.all([
+      import("https://cdn.jsdelivr.net/npm/@picovoice/porcupine-web@4.0.0/dist/esm/index.min.js"),
+      import("https://cdn.jsdelivr.net/npm/@picovoice/web-voice-processor@4.0.9/dist/esm/index.min.js"),
+    ]);
+    wvp = WebVoiceProcessor;
+    porcupine = await PorcupineWorker.create(
+      accessKey,
+      { label: CONFIG.WAKE_WORD_LABEL, publicPath: CONFIG.PORCUPINE_KEYWORD_PATH },
+      onWake,
+      { publicPath: CONFIG.PORCUPINE_MODEL_PATH }
+    );
+    await wvp.subscribe(porcupine);
+    setState(STATE.ASLEEP, 'Say "Rosey" to wake me');
+  } catch (e) {
+    // Any failure — missing key, missing .ppn/.pv model files, SDK or network
+    // error — must not brick the app. Fall back to tap-to-wake, which always
+    // works: the orb's click handler calls onWake() while state is ASLEEP.
+    console.error("porcupine init failed; falling back to tap-to-wake:", e);
+    try { await stopPorcupine(); } catch (_) {}
+    setState(STATE.ASLEEP, "Tap the orb to talk");
+  }
 }
 
 async function stopPorcupine() {
@@ -272,6 +330,7 @@ async function openSession() {
   responsePending = false;
   wakeInterruptSent = false;
   pendingResponseAfterCancel = false;
+  stopRequested = false;
   inputTranscripts.clear();
   respondedInputItems.clear();
 
@@ -335,8 +394,10 @@ async function openSession() {
     if (!sdpResp.ok) throw new Error("realtime SDP failed: " + sdpResp.status);
     await pc.setRemoteDescription({ type: "answer", sdp: await sdpResp.text() });
 
-    // 5) Safety net: hard cap on session length.
-    hardTimer = setTimeout(() => endSession("hard-timeout"), CONFIG.HARD_TIMEOUT_MS);
+    // 5) Safety net: close if no completed turn happens for HARD_TIMEOUT_MS.
+    // Re-armed on every response.done (see handleEvent), so a real conversation
+    // keeps going; this only fires when the session is held open without turns.
+    armHardTimeout();
   } catch (err) {
     console.error(err);
     setState(STATE.ERROR, "Couldn't connect. Going back to sleep.");
@@ -427,6 +488,16 @@ function armReadyTimeout() {
   }, CONFIG.READY_TIMEOUT_MS);
 }
 
+// Backstop against a session held open without real conversation (e.g. a noisy
+// room where VAD keeps tripping but no turn completes, or a wedged state). It is
+// re-armed on every completed turn (response.done), so an active back-and-forth
+// is NEVER cut off — the clock only runs during a stretch with no completed
+// turn. Idle-after-a-reply is handled separately by the shorter follow-up window.
+function armHardTimeout() {
+  clearTimeout(hardTimer);
+  hardTimer = setTimeout(() => endSession("hard-timeout"), CONFIG.HARD_TIMEOUT_MS);
+}
+
 function isTranscriptionPromptEcho(transcript) {
   // The session's transcription prompt ("Listen for the wake word Rosey, also
   // commonly transcribed as Rosie") gets regurgitated as a phantom transcript on
@@ -451,11 +522,41 @@ function commandAfterWakeWord(transcript) {
     .trim();
 }
 
+// True only for a deliberate dismissal like "Rosey stop": needs the wake word,
+// a closer keyword, AND essentially nothing else said — so "Rosey, can you stop
+// the timer" or "remind me to stop by, Rosey" don't accidentally end the session.
+function isStopPhrase(transcript) {
+  const t = transcript || "";
+  if (!hasWakeWord(t) || !CONFIG.STOP_WORDS_RE.test(t)) return false;
+  const residual = t
+    .replace(CONFIG.WAKE_WORD_ONLY_RE, " ")
+    .replace(/\b(stop|sleep|go to sleep|goodbye|good ?night|bye|dismiss|that'?s all|i'?m done|we'?re done|never ?mind|please|now|then|thanks?|thank you|okay|ok|yes|no|nope|nothing|hey|hi|hello)\b/gi, " ")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return residual.length === 0;
+}
+
+// Handle a spoken closer: cut off any in-flight reply and go straight back to
+// sleep. Takes precedence over wake-word interrupt and over creating a reply.
+function maybeStopWord(transcript) {
+  if (stopRequested || !transcript || !isStopPhrase(transcript)) return false;
+  stopRequested = true;
+  console.log("stop-word — closing session:", transcript);
+  clearTimeout(followupTimer);
+  if (responseActive) { try { send({ type: "response.cancel" }); } catch (e) {} }
+  setTranscript("");
+  setState(STATE.ASLEEP, "Going to sleep…");
+  endSession("stop-word");
+  return true;
+}
+
 function createResponse(reason) {
   // Guard on responsePending too: responseActive only flips true when the
   // response.created event arrives (a round-trip later), so without this a
   // second create fired in that window slips through and the server rejects it
   // with conversation_already_has_active_response.
+  if (stopRequested) return false;
   if (responseActive || responsePending || !realtimeReady) return false;
   responsePending = true;
   console.log("creating response:", reason);
@@ -482,6 +583,7 @@ function rememberInputTranscript(evt) {
   const next = evt.transcript || ((inputTranscripts.get(itemId) || "") + (evt.delta || ""));
   inputTranscripts.set(itemId, next);
   if (evt.type === "conversation.item.input_audio_transcription.delta") {
+    if (maybeStopWord(next)) return { itemId, transcript: next };
     maybeWakeInterrupt(next);
   }
   return { itemId, transcript: next };
@@ -489,6 +591,7 @@ function rememberInputTranscript(evt) {
 
 function maybeRespondToCompletedInput(evt) {
   const { itemId, transcript } = rememberInputTranscript(evt);
+  if (maybeStopWord(transcript)) return;
   if (respondedInputItems.has(itemId) || isTranscriptionPromptEcho(transcript)) return;
 
   if (responseActive) {
@@ -511,24 +614,27 @@ function handleEvent(evt) {
 
     case "input_audio_buffer.speech_started":
       clearTimeout(followupTimer);
+      toolResultChainCount = 0;  // new user utterance — reset the loop guard
       inputTranscripts.clear();
       setState(STATE.LISTENING, "Listening…");
       break;
 
     case "response.created":
-      // A new response is starting (often the second response that reads the
-      // tool result). Cancel any pending follow-up/sleep timer so we don't
-      // end the session mid-answer during a tool round-trip.
+      // A new response is starting (often the follow-up that reads a tool
+      // result). Cancel any pending follow-up/sleep timer so we don't end the
+      // session mid-answer during a tool round-trip.
       clearTimeout(followupTimer);
       responseActive = true;
       responsePending = false;   // the create we sent has landed
       wakeInterruptSent = false;
+      toolCallThisResponse = false;       // fresh per-response tracking
       setTranscript("");         // start each spoken response fresh (no run-together)
       setState(STATE.THINKING, "…");
       break;
 
     // Live transcript of Rosey's spoken reply.
     case "response.output_audio_transcript.delta":
+      toolResultChainCount = 0;  // the model is actually speaking — real progress
       setTranscript((els.transcript.textContent || "") + (evt.delta || ""));
       break;
 
@@ -537,6 +643,20 @@ function handleEvent(evt) {
     case "response.done":
       responseActive = false;
       responsePending = false;
+      // A real turn just completed — push the hard-timeout backstop out so an
+      // ongoing back-and-forth is never cut off mid-conversation.
+      armHardTimeout();
+      console.log("response.done — tool:", toolCallThisResponse);
+      // Remote MCP runs the tool AFTER the requesting turn ends, so its result
+      // often arrives with no active turn to voice it (handled in
+      // response.output_item.done). If the tool finished while this turn was
+      // still going, speak the result now.
+      if (pendingToolResult) {
+        pendingToolResult = false;
+        toolResultChainCount++;
+        createResponse("speak-tool-result");
+        break;
+      }
       if (pendingResponseAfterCancel) {
         pendingResponseAfterCancel = false;
         createResponse("wake-word-after-cancel");
@@ -572,6 +692,7 @@ function handleEvent(evt) {
     case "response.mcp_call.in_progress":
       // Tool is running — keep the session alive; the answer comes after.
       clearTimeout(followupTimer);
+      toolCallThisResponse = true;
       console.log("[mcp] tool running…");
       break;
     case "response.mcp_call.failed":
@@ -595,7 +716,26 @@ function handleEvent(evt) {
 
     case "response.output_item.done":
       if (evt.item?.type === "mcp_call") {
+        toolCallThisResponse = true;
         console.log(`[mcp] ${evt.item.server_label}.${evt.item.name} ->`, evt.item.output);
+        // This is the fix for the "stuck until I tap" bug. With remote MCP the
+        // turn that REQUESTED the tool has already ended by the time the result
+        // lands (response.done fires before this event), and OpenAI does NOT
+        // start a new turn to voice the result — so the session sits idle on
+        // "Anything else?" holding the answer. Create that follow-up turn here.
+        // If a turn somehow is still active, defer to response.done instead of
+        // colliding with it. The chain cap stops a misbehaving model that keeps
+        // calling tools without ever speaking from looping forever.
+        if (toolResultChainCount >= 5) {
+          console.warn("[mcp] tool-result chain cap reached; not auto-continuing");
+          setState(STATE.LISTENING, "Anything else?");
+          armFollowupWindow();
+        } else if (responseActive) {
+          pendingToolResult = true;
+        } else {
+          toolResultChainCount++;
+          createResponse("speak-tool-result");
+        }
       }
       break;
 
@@ -637,8 +777,12 @@ async function endSession(reason) {
   expectMcpTools = false;
   serverConfiguredSession = false;
   responseActive = false;
+  responsePending = false;
   wakeInterruptSent = false;
   pendingResponseAfterCancel = false;
+  pendingToolResult = false;
+  toolCallThisResponse = false;
+  toolResultChainCount = 0;
   inputTranscripts.clear();
   respondedInputItems.clear();
 

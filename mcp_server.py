@@ -39,14 +39,19 @@ except ImportError:  # pragma: no cover
 from mcp.server.fastmcp import FastMCP
 
 import feed_format
+import reminder_builder
 from paths import memories_dir
 from reminder_format import (
     ACKED_RE,
+    ESC_RE,
     FB_RE,
     FROM_RE,
     ID_RE,
     LINE_RE,
     MENTION_RE,
+    MISS_RE,
+    REPEAT_RE,
+    URG_RE,
     _strip_to_user_message,
 )
 
@@ -122,6 +127,18 @@ def add_grocery_item(item: str) -> str:
     return f"Added '{item}' to the grocery list."
 
 
+@mcp.tool()
+def get_current_time() -> str:
+    """Return the current local date and time. This reads the SAME clock the
+    scheduler uses to fire reminders, so it always matches when things go off.
+
+    Call this for ANY 'what time is it', 'what's the date', or 'what day is it'
+    question — you do not have a clock of your own, so check here instead of
+    guessing or saying you can't tell."""
+    now = _local_now()
+    return f"It's {_fmt_time(now)} on {now.strftime('%A')}, {now.strftime('%B')} {now.day}, {now.year}."
+
+
 # --- reminder readback helpers ----------------------------------------------
 # reminders.md is an append-only lifecycle log: pending items live at the top
 # ("head"), and the scheduler moves fired/missed/etc. lines down into
@@ -138,13 +155,29 @@ def _local_now() -> datetime:
     return datetime.now(tz=tz)
 
 
+# The scheduler (scheduler.py._split_sections) treats ONLY these as section
+# boundaries; every other "## ..." line is ordinary content inside the pending
+# head. The readback MUST use the same definition — otherwise a stray header the
+# agent might write (e.g. "## Pending") truncates the head here while the
+# scheduler keeps firing the lines below it, so reminders silently vanish from
+# "list/update/delete" even though they still go off. Match the scheduler exactly.
+_SECTION_HEADERS = ("## Fired", "## Missed", "## Malformed", "## Failed_Delivery")
+
+
+def _is_section_header(line: str) -> bool:
+    s = line.strip()
+    return any(s == h or s.startswith(h + " ") for h in _SECTION_HEADERS)
+
+
 def _pending_head(content: str) -> str:
-    """The 'head' of reminders.md — everything before the first '## ' section
-    header. Fired/Missed/Malformed/Failed_Delivery all live below a header, so
-    the head is exactly the set of not-yet-fired (pending) reminders."""
+    """The 'head' of reminders.md — everything before the first RECOGNIZED
+    section header (Fired/Missed/Malformed/Failed_Delivery). The head is the set
+    of not-yet-fired (pending) reminders. Unknown '## ...' lines are treated as
+    inline content, exactly as the scheduler does, so they can't hide pending
+    reminders the scheduler is still firing."""
     out: list[str] = []
     for raw in content.splitlines():
-        if raw.lstrip().startswith("## "):
+        if _is_section_header(raw):
             break
         out.append(raw)
     return "\n".join(out)
@@ -462,6 +495,261 @@ def add_reminder(text: str, when: str = "") -> str:
     # out to the whole household (the right default for a shared appliance).
     _append("reminders.md", f"- [{ts}] {body} urg:normal")
     return f'Added "{body}" for {_date_label(dt.date(), now.date())} at {_fmt_time(dt)}.'
+
+
+# --- editing / cancelling existing reminders ---------------------------------
+# update_reminder / delete_reminder operate on the pending "head" of
+# reminders.md, the same source of truth add_reminder appends to. They rewrite
+# the matched line (or drop it) and leave the ## Fired / ## Missed / ...
+# sections below untouched. The engine's scheduler reconciles the change on its
+# next pass: a retimed or text-changed line gets a fresh id (we strip the old
+# one, mirroring scheduler.py's own recurrence roll) so the stale job ladder is
+# retired; a deleted line is orphaned out, and any fire that races reconcile
+# self-skips because the id is gone. A recurring reminder is just a pending line
+# carrying a `repeat:` tag, so deleting it stops the chain and clearing the tag
+# lets the next occurrence fire without rescheduling.
+
+# Trailing machine tokens the agent appends after the message text. Used to
+# split a line's "user text" from its "tags" so we can edit one without losing
+# the other (recipients, urgency, recurrence, …).
+_TAG_RES = (MENTION_RE, FROM_RE, ID_RE, ESC_RE, MISS_RE, URG_RE, FB_RE, REPEAT_RE)
+
+
+def _split_head_tail(content: str) -> tuple[list[str], str]:
+    """Split reminders.md into (head_lines, tail). Head is the pending region
+    before the first RECOGNIZED section header (Fired/Missed/Malformed/
+    Failed_Delivery); tail is that header onward, preserved verbatim so we never
+    disturb fired/missed/failed history. Uses the same header set as the
+    scheduler so a stray '## ...' line can't hide pending reminders from
+    update/delete."""
+    lines = content.splitlines()
+    for i, raw in enumerate(lines):
+        if _is_section_header(raw):
+            return lines[:i], "\n".join(lines[i:])
+    return lines, ""
+
+
+def _write_reminders(head_lines: list[str], tail: str) -> None:
+    head = "\n".join(head_lines).strip()
+    if tail.strip():
+        content = (head + "\n\n" + tail.strip() + "\n") if head else (tail.strip() + "\n")
+    else:
+        content = (head + "\n") if head else ""
+    _write("reminders.md", content)
+
+
+def _split_message_tags(message: str) -> tuple[str, str]:
+    """Split a reminder's message portion into (user_text, tags). The agent
+    writes free text first, then tokens (@mentions, from:, urg:, repeat:, …), so
+    we cut at the earliest token (or '(' annotation) and keep the rest verbatim."""
+    starts = [mm.start() for rx in _TAG_RES for mm in rx.finditer(message)]
+    paren = message.find("(")
+    if paren != -1:
+        starts.append(paren)
+    if not starts:
+        return message.strip(), ""
+    cut = min(starts)
+    return message[:cut].strip(), message[cut:].strip()
+
+
+def _match_pending(content: str, match: str) -> list[dict]:
+    """Pending head reminders whose user-facing text contains `match`
+    (case-insensitive). Each item: {idx into head_lines, line, text, dt|None}."""
+    head_lines, _ = _split_head_tail(content)
+    needle = " ".join((match or "").lower().split())
+    out: list[dict] = []
+    for idx, raw in enumerate(head_lines):
+        line = raw.strip()
+        if not line.startswith("- ") or ACKED_RE.search(line):
+            continue
+        m = LINE_RE.match(line)
+        if m:
+            ts_str = m.group(1).replace("T", " ")
+            text = _strip_to_user_message(m.group(2))
+            try:
+                dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
+            except ValueError:
+                dt = None
+        else:
+            text = _clean_undated(line[2:])
+            dt = None
+        if not text:
+            continue
+        if needle and needle not in text.lower():
+            continue
+        out.append({"idx": idx, "line": raw, "text": text, "dt": dt})
+    return out
+
+
+def _describe_reminder(hit: dict) -> str:
+    if hit["dt"] is not None:
+        now = _local_now()
+        return f'"{hit["text"]}" ({_date_label(hit["dt"].date(), now.date())} at {_fmt_time(hit["dt"])})'
+    return f'"{hit["text"]}"'
+
+
+@mcp.tool()
+def update_reminder(match: str, new_text: str = "", when: str = "", repeat: str = "") -> str:
+    """Change an existing PENDING reminder — its time, its wording, and/or how it
+    repeats. Identify which one with `match`: a few distinctive words from the
+    reminder's text (case-insensitive). At least one of new_text/when/repeat must
+    be given.
+
+      new_text — replace the wording. Recipients and other tags are kept.
+      when     — reschedule it. Same phrasings as add_reminder: 'tomorrow 9am',
+                 'friday 8am', 'in 2 hours', '6pm', 'YYYY-MM-DD HH:MM'.
+      repeat   — change the recurrence: 'daily', 'weekly', 'hourly', or a span
+                 like '2h', '30m', '3d'. Use 'none' (or 'stop'/'off') to STOP it
+                 repeating: the next occurrence still happens but it won't
+                 reschedule after that. To cancel it outright, use delete_reminder.
+
+    If `match` hits more than one reminder, this lists them so you can ask which.
+    """
+    content = _read("reminders.md")
+    hits = _match_pending(content, match)
+    if not hits:
+        if not match:
+            return "Which reminder should I change? Tell me a few words from it."
+        return (f'I don\'t see a pending reminder matching "{match}". '
+                "Say 'list my reminders' to hear what's set.")
+    if len(hits) > 1:
+        listing = "; ".join(_describe_reminder(h) for h in hits)
+        return f'I found a few reminders matching "{match}": {listing}. Which one?'
+    if not (new_text.strip() or when.strip() or repeat.strip()):
+        return "What should I change — the time, the wording, or how often it repeats?"
+
+    hit = hits[0]
+    line = hit["line"].strip()
+    m = LINE_RE.match(line)
+    if m:
+        ts_str = m.group(1).replace("T", " ")
+        message = m.group(2)
+    else:
+        ts_str = ""
+        message = line[2:]
+
+    text_part, tags_part = _split_message_tags(message)
+    # Drop the old id so the reconciler assigns a fresh one and retires the old
+    # job ladder — same convention scheduler.py uses when it rolls a recurrence.
+    tags_part = ID_RE.sub("", tags_part).strip()
+
+    if new_text.strip():
+        text_part = " ".join(new_text.split())
+
+    if repeat.strip():
+        r = repeat.strip().lower()
+        if r in ("none", "off", "stop", "no", "never", "once"):
+            tags_part = REPEAT_RE.sub("", tags_part).strip()
+        elif re.fullmatch(r"daily|weekly|hourly|\d+[mhd]", r):
+            if REPEAT_RE.search(tags_part):
+                tags_part = REPEAT_RE.sub(f"repeat:{r}", tags_part)
+            else:
+                tags_part = (tags_part + f" repeat:{r}").strip()
+        else:
+            return (f'I didn\'t understand the repeat "{repeat}". Try daily, weekly, '
+                    "hourly, or a span like 2h or 30m — or 'none' to stop repeating.")
+
+    now = _local_now()
+    dt: datetime | None
+    if when.strip():
+        dt = _parse_when(when, now)
+        if dt is None:
+            return (f'I couldn\'t work out a new time from "{when}". '
+                    "Try 'tomorrow at 9am' or 'in 2 hours'.")
+        ts_str = dt.strftime("%Y-%m-%d %H:%M")
+    elif ts_str:
+        try:
+            dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
+        except ValueError:
+            dt = None
+    else:
+        dt = None
+
+    new_message = " ".join((text_part + " " + tags_part).split())
+    new_line = f"- [{ts_str}] {new_message}".rstrip() if ts_str else f"- {new_message}".rstrip()
+
+    head_lines, tail = _split_head_tail(content)
+    head_lines[hit["idx"]] = new_line
+    _write_reminders(head_lines, tail)
+
+    clean = _strip_to_user_message(new_message) or text_part
+    when_str = f" — {_date_label(dt.date(), now.date())} at {_fmt_time(dt)}" if dt else ""
+    rep = REPEAT_RE.search(new_message)
+    rep_str = f", repeating {rep.group(1)}" if rep else ""
+    return f'Updated "{clean}"{when_str}{rep_str}.'
+
+
+@mcp.tool()
+def delete_reminder(match: str) -> str:
+    """Cancel/remove a PENDING reminder entirely. Identify it with `match`: a few
+    distinctive words from its text (case-insensitive). This also stops a
+    recurring reminder for good — it removes the pending occurrence that would
+    otherwise reschedule. If `match` hits more than one, this lists them so you
+    can ask which to cancel."""
+    content = _read("reminders.md")
+    hits = _match_pending(content, match)
+    if not hits:
+        if not match:
+            return "Which reminder should I cancel? Tell me a few words from it."
+        return f'I don\'t see a pending reminder matching "{match}".'
+    if len(hits) > 1:
+        listing = "; ".join(_describe_reminder(h) for h in hits)
+        return f'I found a few matching "{match}": {listing}. Which one should I cancel?'
+
+    hit = hits[0]
+    head_lines, tail = _split_head_tail(content)
+    del head_lines[hit["idx"]]
+    _write_reminders(head_lines, tail)
+
+    extra = " It won't repeat anymore." if REPEAT_RE.search(hit["line"]) else ""
+    when_str = ""
+    if hit["dt"] is not None:
+        now = _local_now()
+        when_str = f" ({_date_label(hit['dt'].date(), now.date())} at {_fmt_time(hit['dt'])})"
+    return f'Cancelled "{hit["text"]}"{when_str}.{extra}'
+
+
+@mcp.tool()
+def add_recurring_reminder(
+    text: str,
+    times: str,
+    repeat: str = "daily",
+    recipients: str = "",
+    urgency: str = "normal",
+) -> str:
+    """Create a reminder that fires at one or MORE times of day, optionally
+    recurring. Use this for 'N times a day', 'morning and night', or any
+    multi-time / repeating reminder (for a single one-off time, add_reminder is
+    fine). Each time is scheduled at its next future occurrence — today if it's
+    still ahead, otherwise tomorrow — so nothing is ever set in the past.
+
+      times      — comma-separated clock times, e.g. "9am, 11am, 1pm, 3pm, 5pm"
+                   or "8:00, 20:00".
+      repeat     — "daily" (default), "weekly", "hourly", or a span like "2h" /
+                   "30m" / "3d". Pass "none" for one-time reminders at those times.
+      recipients — comma-separated household names responsible, e.g. "Sunanda".
+                   Omit to remind the whole household.
+      urgency    — low | normal | high (default normal).
+    """
+    now = _local_now()
+    time_list = [t.strip() for t in (times or "").replace(";", ",").split(",") if t.strip()]
+    recip_list = [r.strip() for r in (recipients or "").replace(";", ",").split(",") if r.strip()]
+    rep = None if (repeat or "").strip().lower() in ("none", "off", "once", "") else repeat
+    try:
+        lines, occ = reminder_builder.build_occurrences(
+            text, time_list, now=now, repeat=rep,
+            recipients=recip_list, origin_chat=None, urgency=urgency,
+        )
+    except reminder_builder.ReminderError as e:
+        return str(e)
+    if not lines:
+        return "I couldn't work out any times for that. Try something like '9am, 1pm, 5pm'."
+    content = _read("reminders.md")
+    head_lines, tail = _split_head_tail(content)
+    head_lines.extend(lines)
+    _write_reminders(head_lines, tail)
+    body = " ".join((text or "").split())
+    return f'Set "{body}": {reminder_builder.summarize(occ, now, rep)}.'
 
 
 @mcp.tool()
